@@ -56,6 +56,14 @@ actions!(
         MoveWordLeft,
         /// Moves the caret one word right.
         MoveWordRight,
+        /// Extends the selection one word left.
+        ExtendWordLeft,
+        /// Extends the selection one word right.
+        ExtendWordRight,
+        /// Indents the current line or selected lines.
+        Indent,
+        /// Outdents the current line or selected lines.
+        Outdent,
         /// Moves the caret to the start of the line.
         MoveLineStart,
         /// Moves the caret to the end of the line.

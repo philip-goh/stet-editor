@@ -27,12 +27,12 @@ land and keep this section in sync with reality.
 Feel-level fixes that build on the existing engine. All core changes are
 unit-testable.
 
-- [ ] Deletion grouping in undo: a backspace/delete run is one step; word
+- [x] Deletion grouping in undo: a backspace/delete run is one step; word
       and line kills are single steps (extend `History` coalescing)
-- [ ] Content-hash dirty tracking so undo-to-saved shows clean
-- [ ] Word-wise extend selection (`alt+shift+arrow`)
-- [ ] Double-click selects word, triple-click selects line
-- [ ] Indent/outdent: `Tab`/`Shift+Tab`, block indent for multi-line
+- [x] Content-hash dirty tracking so undo-to-saved shows clean
+- [x] Word-wise extend selection (`alt+shift+arrow`)
+- [x] Double-click selects word, triple-click selects line
+- [x] Indent/outdent: `Tab`/`Shift+Tab`, block indent for multi-line
       selections
 - Acceptance: `stet-core` tests for coalescing, hashing and indent
   helpers; manual smoke of click/undo/indent flows.

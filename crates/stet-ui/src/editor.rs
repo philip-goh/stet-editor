@@ -386,8 +386,8 @@ impl EditorView {
 
     /// Undoes the most recent edit.
     pub fn undo(&mut self, cx: &mut Context<Self>) {
-        if let Some(edit) = self.document.undo() {
-            self.selection.collapse_to(edit.range.start);
+        if let Some(step) = self.document.undo() {
+            self.selection.collapse_to(step.start());
             self.desired_column = None;
             self.refresh(cx);
         }
@@ -395,8 +395,8 @@ impl EditorView {
 
     /// Redoes the most recently undone edit.
     pub fn redo(&mut self, cx: &mut Context<Self>) {
-        if let Some(edit) = self.document.redo() {
-            self.selection.collapse_to(edit.range.start);
+        if let Some(step) = self.document.redo() {
+            self.selection.collapse_to(step.start());
             self.desired_column = None;
             self.refresh(cx);
         }
@@ -430,12 +430,106 @@ impl EditorView {
         self.insert_text(&text, cx);
     }
 
+    /// Indents or outdents the selected lines.
+    ///
+    /// A collapsed selection indents the current line. A multi-line
+    /// selection block-indents every line it touches; the whole batch is a
+    /// single undo step.
+    pub fn indent(&mut self, outdent: bool, cx: &mut Context<Self>) {
+        let unit = self.document.buffer().indent_unit();
+
+        if self.selection.is_empty() {
+            let cursor = self.selection.cursor();
+            let line = self.document.buffer().offset_to_position(cursor).line;
+            let line_start = self.document.buffer().line_start_offset(line);
+            if outdent {
+                let content = self.document.buffer().line_content(line);
+                let prefix = leading_indent_len(&content, &unit);
+                if prefix == 0 {
+                    return;
+                }
+                let edit = self.document.edit(line_start..line_start + prefix, "");
+                let new_cursor = cursor.saturating_sub(prefix).max(edit.range.start);
+                self.selection.collapse_to(new_cursor);
+            } else {
+                let edit = self.document.edit(line_start..line_start, &unit);
+                self.selection.collapse_to(edit.range.start + unit.len());
+            }
+            self.desired_column = None;
+            self.refresh(cx);
+            return;
+        }
+
+        let (first_line, last_line) = {
+            let buffer = self.document.buffer();
+            let first = buffer.offset_to_position(self.selection.start()).line;
+            let mut last = buffer.offset_to_position(self.selection.end()).line;
+            // A selection ending exactly at a line start does not include
+            // that line.
+            if self.selection.end() == buffer.line_start_offset(last) && last > first {
+                last -= 1;
+            }
+            (first, last)
+        };
+
+        let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        for line in first_line..=last_line {
+            let buffer = self.document.buffer();
+            let line_start = buffer.line_start_offset(line);
+            if outdent {
+                let content = buffer.line_content(line);
+                let prefix = leading_indent_len(&content, &unit);
+                if prefix > 0 {
+                    edits.push((line_start..line_start + prefix, String::new()));
+                }
+            } else {
+                edits.push((line_start..line_start, unit.clone()));
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+
+        self.document.edit_batch(edits);
+        let buffer = self.document.buffer();
+        self.selection = Selection::region(
+            buffer.line_start_offset(first_line),
+            buffer.line_end_offset(last_line),
+        );
+        self.desired_column = None;
+        self.refresh(cx);
+    }
+
     /// Starts a mouse selection at `byte`.
-    pub fn begin_selection(&mut self, byte: usize, extend: bool, cx: &mut Context<Self>) {
-        if extend {
-            self.selection.select_to(byte);
-        } else {
-            self.selection.collapse_to(byte);
+    ///
+    /// `click_count` selects the unit: one click places the caret, two
+    /// clicks select the word, three or more select the line. Shift-click
+    /// extends the existing selection.
+    pub fn begin_selection(
+        &mut self,
+        byte: usize,
+        extend: bool,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match click_count {
+            2 => {
+                let range = self.document.buffer().word_range_at(byte);
+                self.selection = Selection::region(range.start, range.end);
+            }
+            count if count >= 3 => {
+                let buffer = self.document.buffer();
+                let line = buffer.offset_to_position(byte).line;
+                self.selection =
+                    Selection::region(buffer.line_start_offset(line), buffer.line_end_offset(line));
+            }
+            _ => {
+                if extend {
+                    self.selection.select_to(byte);
+                } else {
+                    self.selection.collapse_to(byte);
+                }
+            }
         }
         self.desired_column = None;
         self.dragging = true;
@@ -656,6 +750,22 @@ impl Element for LineElement {
                 editor.record_line_layout(self.line, LineLayout { bounds, shaped });
             });
         }
+    }
+}
+
+/// Returns the byte length of the removable indent prefix of `content`.
+///
+/// A tab removes one tab; otherwise up to `unit`'s width in leading spaces
+/// is removed (four spaces when the document indents with tabs).
+fn leading_indent_len(content: &str, unit: &str) -> usize {
+    if content.starts_with('\t') {
+        return 1;
+    }
+    let spaces = content.bytes().take_while(|byte| *byte == b' ').count();
+    if unit == "\t" {
+        spaces.min(4)
+    } else {
+        spaces.min(unit.len())
     }
 }
 

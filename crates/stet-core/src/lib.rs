@@ -34,7 +34,7 @@ mod text;
 pub use document::Document;
 pub use edit::{AppliedEdit, EditKind, EditSummary, Point};
 pub use error::{Error, Result};
-pub use history::History;
+pub use history::{History, UndoStep};
 pub use position::Position;
 pub use selection::Selection;
 pub use text::{LineEnding, TextBuffer};

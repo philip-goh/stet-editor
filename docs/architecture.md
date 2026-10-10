@@ -30,11 +30,13 @@ Everything that is true independent of a screen lives here:
   access, char/line/column conversion, grapheme- and word-boundary
   navigation, and an `edit()` that returns an `AppliedEdit` describing both
   how to undo the change and how tree-sitter should adjust its parse.
-- `Document` — buffer + path + revision-based dirty state + undo history +
+- `Document` — buffer + path + content-hash dirty state + undo history +
   atomic save. UTF-8 only for now (BOM stripped), line endings preserved.
 - `Selection` — anchor/head byte offsets. The head is the caret.
-- `History` — undo/redo over `AppliedEdit`s with coalescing of consecutive
-  single-character insertions.
+- `History` — undo/redo over `UndoStep`s: one or more `AppliedEdit`s that
+  undo together. Insertion and deletion runs coalesce; batched operations
+  (block indent, and later multi-cursor typing and replace-all) record a
+  transaction so they undo as one unit.
 
 Rules of the layer:
 
@@ -116,5 +118,4 @@ for bugs:
 - IME/composition is not wired (`key_char` only).
 - No multi-cursor, no find/replace, no line wrapping.
 - Highlighting is synchronous and size-limited.
-- Dirty state is revision-based, not content-hash based.
 - No settings file; the action list is static.

@@ -74,12 +74,17 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-down", ExtendDown, None),
         KeyBinding::new("alt-left", MoveWordLeft, None),
         KeyBinding::new("alt-right", MoveWordRight, None),
+        KeyBinding::new("alt-shift-left", ExtendWordLeft, None),
+        KeyBinding::new("alt-shift-right", ExtendWordRight, None),
         KeyBinding::new("home", MoveLineStart, None),
         KeyBinding::new("end", MoveLineEnd, None),
         KeyBinding::new("cmd-left", MoveLineStart, None),
         KeyBinding::new("cmd-right", MoveLineEnd, None),
         KeyBinding::new("cmd-up", MoveDocumentStart, None),
         KeyBinding::new("cmd-down", MoveDocumentEnd, None),
+        // Indentation.
+        KeyBinding::new("tab", Indent, None),
+        KeyBinding::new("shift-tab", Outdent, None),
         // Deletion and insertion.
         KeyBinding::new("backspace", DeleteBackward, None),
         KeyBinding::new("delete", DeleteForward, None),

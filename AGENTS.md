@@ -108,8 +108,6 @@ Write an ADR in `docs/adr/`, next number, using the template in
   and CJK composition need a real `EntityInputHandler` (roadmap M1).
 - **Palette routes actions.** When the palette is open, editing actions are
   intercepted by the workspace handlers and must not reach the editor.
-- **Dirty state is revision-based**, so undo-to-saved-state still shows
-  dirty. Content-hash tracking is a roadmap item; don't "fix" it ad hoc.
 
 ## Verification checklist before finishing
 

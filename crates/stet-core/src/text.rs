@@ -1,5 +1,7 @@
 //! The rope-backed text buffer.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use ropey::Rope;
@@ -338,6 +340,68 @@ impl TextBuffer {
         }
     }
 
+    /// Returns a hash of the buffer contents.
+    ///
+    /// The hash is computed over the rope's chunks without materializing a
+    /// string, so it is cheap enough to run after every edit. It is stable
+    /// for the lifetime of the process, which is all dirty tracking needs.
+    pub fn content_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for chunk in self.rope.chunks() {
+            chunk.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Returns the byte range of the word at or immediately before `byte`.
+    ///
+    /// A click on the trailing edge of a word selects that word, matching
+    /// what double-click users expect. When `byte` touches no word, an
+    /// empty range at `byte` is returned. The range never crosses a line.
+    pub fn word_range_at(&self, byte: usize) -> Range<usize> {
+        let byte = byte.min(self.len_bytes());
+        let line = self.rope.byte_to_line(byte);
+        let line_start = self.rope.line_to_byte(line);
+        let content = self.line_content(line);
+        let bytes = content.as_bytes();
+        let relative = (byte - line_start).min(content.len());
+        let probe = if relative < bytes.len() && is_word_byte(bytes[relative]) {
+            relative
+        } else if relative > 0 && is_word_byte(bytes[relative - 1]) {
+            relative - 1
+        } else {
+            return byte..byte;
+        };
+        let mut start = probe;
+        while start > 0 && is_word_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = probe;
+        while end < bytes.len() && is_word_byte(bytes[end]) {
+            end += 1;
+        }
+        line_start + start..line_start + end
+    }
+
+    /// Guesses the indentation unit used by the document.
+    ///
+    /// Returns a tab if the first indented line uses tabs, otherwise that
+    /// line's leading space count (clamped to 1–8), defaulting to four
+    /// spaces. A settings system will make this explicit later.
+    pub fn indent_unit(&self) -> String {
+        for line in 0..self.line_count().min(200) {
+            let content = self.line_content(line);
+            if content.starts_with('\t') {
+                return "\t".to_owned();
+            }
+            let spaces = content.bytes().take_while(|byte| *byte == b' ').count();
+            if spaces > 0 {
+                return " ".repeat(spaces.min(8));
+            }
+        }
+        "    ".to_owned()
+    }
+
     fn clamp_byte_range(&self, range: Range<usize>) -> (usize, usize) {
         let len = self.len_bytes();
         let start = range.start.min(len);
@@ -500,6 +564,68 @@ mod tests {
         assert_eq!(buffer.next_word_boundary(4), 7);
         assert_eq!(buffer.prev_word_boundary(4), 3);
         assert_eq!(buffer.prev_word_boundary(7), 4);
+    }
+
+    #[test]
+    fn word_range_selects_the_word_under_the_offset() {
+        let buffer = TextBuffer::new("foo bar_baz!");
+        assert_eq!(buffer.word_range_at(0), 0..3);
+        assert_eq!(buffer.word_range_at(2), 0..3);
+        // A click on the edge of a word still selects it.
+        assert_eq!(buffer.word_range_at(3), 0..3);
+        assert_eq!(buffer.word_range_at(4), 4..11);
+        assert_eq!(buffer.word_range_at(11), 4..11);
+        // Offsets touching no word produce an empty range.
+        assert_eq!(buffer.word_range_at(12), 12..12);
+        let punctuation_only = TextBuffer::new("...");
+        assert_eq!(punctuation_only.word_range_at(1), 1..1);
+    }
+
+    #[test]
+    fn word_range_handles_multibyte_words() {
+        let buffer = TextBuffer::new("héllo wörld");
+        assert_eq!(buffer.word_range_at(1), 0..6);
+        assert_eq!(buffer.word_range_at(8), 7..13);
+    }
+
+    #[test]
+    fn word_range_does_not_cross_lines() {
+        let buffer = TextBuffer::new("one\ntwo");
+        assert_eq!(buffer.word_range_at(4), 4..7);
+        // At the newline, the word on the line the offset belongs to wins.
+        assert_eq!(buffer.word_range_at(3), 0..3);
+    }
+
+    #[test]
+    fn content_hash_tracks_content_not_identity() {
+        let mut buffer = TextBuffer::new("hello");
+        let original = buffer.content_hash();
+        assert_eq!(buffer.content_hash(), original);
+        buffer.edit(5..5, "!");
+        assert_ne!(buffer.content_hash(), original);
+        buffer.edit(5..6, "");
+        assert_eq!(buffer.content_hash(), original);
+    }
+
+    #[test]
+    fn content_hash_matches_for_equal_content() {
+        let a = TextBuffer::new("same\ncontent");
+        let b = TextBuffer::new("same\ncontent");
+        let c = TextBuffer::new("different");
+        assert_eq!(a.content_hash(), b.content_hash());
+        assert_ne!(a.content_hash(), c.content_hash());
+    }
+
+    #[test]
+    fn indent_unit_detects_tabs_spaces_and_default() {
+        assert_eq!(TextBuffer::new("fn main() {}").indent_unit(), "    ");
+        assert_eq!(TextBuffer::new("a\n\tb").indent_unit(), "\t");
+        assert_eq!(TextBuffer::new("a\n  b").indent_unit(), "  ");
+        assert_eq!(TextBuffer::new("a\n        b").indent_unit(), "        ");
+        assert_eq!(
+            TextBuffer::new("a\n            b").indent_unit(),
+            "        "
+        );
     }
 
     #[test]

@@ -315,6 +315,32 @@ impl Workspace {
         self.with_active_editor(cx, |editor, cx| editor.move_word(true, false, cx));
     }
 
+    fn on_extend_word_left(
+        &mut self,
+        _: &ExtendWordLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_active_editor(cx, |editor, cx| editor.move_word(false, true, cx));
+    }
+
+    fn on_extend_word_right(
+        &mut self,
+        _: &ExtendWordRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_active_editor(cx, |editor, cx| editor.move_word(true, true, cx));
+    }
+
+    fn on_indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.with_active_editor(cx, |editor, cx| editor.indent(false, cx));
+    }
+
+    fn on_outdent(&mut self, _: &Outdent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.with_active_editor(cx, |editor, cx| editor.indent(true, cx));
+    }
+
     fn on_move_line_start(
         &mut self,
         _: &MoveLineStart,
@@ -476,7 +502,10 @@ impl Workspace {
         }
         if let Some((_line, byte)) = editor.read(cx).hit_test(event.position) {
             let extend = event.modifiers.shift;
-            editor.update(cx, |editor, cx| editor.begin_selection(byte, extend, cx));
+            let click_count = event.click_count;
+            editor.update(cx, |editor, cx| {
+                editor.begin_selection(byte, extend, click_count, cx);
+            });
         }
         let handle = editor.read(cx).focus_handle().clone();
         window.focus(&handle);
@@ -999,6 +1028,10 @@ impl gpui::Render for Workspace {
             .on_action(cx.listener(Self::on_extend_down))
             .on_action(cx.listener(Self::on_move_word_left))
             .on_action(cx.listener(Self::on_move_word_right))
+            .on_action(cx.listener(Self::on_extend_word_left))
+            .on_action(cx.listener(Self::on_extend_word_right))
+            .on_action(cx.listener(Self::on_indent))
+            .on_action(cx.listener(Self::on_outdent))
             .on_action(cx.listener(Self::on_move_line_start))
             .on_action(cx.listener(Self::on_move_line_end))
             .on_action(cx.listener(Self::on_move_document_start))

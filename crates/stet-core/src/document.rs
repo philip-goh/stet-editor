@@ -1,26 +1,26 @@
 //! File-backed documents: a text buffer plus path, dirty state and history.
 
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::edit::AppliedEdit;
 use crate::error::{Error, Result};
-use crate::history::History;
+use crate::history::{History, UndoStep};
 use crate::text::TextBuffer;
 
 /// A text buffer with file identity, dirty tracking and undo/redo.
 ///
-/// Dirty state is revision-based: every edit, undo or redo bumps a
-/// revision counter, and saving records the revision that was written.
-/// A consequence is that undoing back to exactly the saved content still
-/// reports dirty; content-hash based cleanliness is a roadmap item.
+/// Dirty state is content-hash based: a document is clean exactly when its
+/// current text hashes to what was last loaded or saved, so undoing back to
+/// the saved content correctly clears the dirty marker.
 #[derive(Debug)]
 pub struct Document {
     buffer: TextBuffer,
     history: History,
     path: Option<PathBuf>,
-    revision: u64,
-    saved_revision: u64,
+    content_hash: u64,
+    saved_hash: u64,
 }
 
 impl Document {
@@ -31,12 +31,14 @@ impl Document {
 
     /// Creates an untitled document with initial text.
     pub fn from_text(text: impl AsRef<str>) -> Self {
+        let buffer = TextBuffer::new(text);
+        let hash = buffer.content_hash();
         Self {
-            buffer: TextBuffer::new(text),
+            buffer,
             history: History::new(),
             path: None,
-            revision: 0,
-            saved_revision: 0,
+            content_hash: hash,
+            saved_hash: hash,
         }
     }
 
@@ -52,12 +54,14 @@ impl Document {
         })?;
         let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
         let text = std::str::from_utf8(bytes).map_err(|_| Error::NotUtf8 { path: path.clone() })?;
+        let buffer = TextBuffer::new(text);
+        let hash = buffer.content_hash();
         Ok(Self {
-            buffer: TextBuffer::new(text),
+            buffer,
             history: History::new(),
             path: Some(path),
-            revision: 1,
-            saved_revision: 1,
+            content_hash: hash,
+            saved_hash: hash,
         })
     }
 
@@ -82,29 +86,61 @@ impl Document {
 
     /// Returns `true` if there are unsaved changes.
     pub fn is_dirty(&self) -> bool {
-        self.revision != self.saved_revision
+        self.content_hash != self.saved_hash
+    }
+
+    /// Returns `true` if there is an edit to undo.
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    /// Returns `true` if there is an edit to redo.
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
     }
 
     /// Applies an edit and records it in the history.
-    pub fn edit(&mut self, range: std::ops::Range<usize>, text: &str) -> AppliedEdit {
+    pub fn edit(&mut self, range: Range<usize>, text: &str) -> AppliedEdit {
         let edit = self.buffer.edit(range, text);
         self.history.record(edit.clone());
-        self.revision += 1;
+        self.content_hash = self.buffer.content_hash();
         edit
     }
 
-    /// Undoes the most recent edit, if any.
-    pub fn undo(&mut self) -> Option<AppliedEdit> {
-        let edit = self.history.undo(&mut self.buffer)?;
-        self.revision += 1;
-        Some(edit)
+    /// Applies several edits as one undo step.
+    ///
+    /// All ranges are in the coordinate space of the buffer *before* the
+    /// batch; edits are applied right to left so they do not shift each
+    /// other. Manual ordering by the caller is not required.
+    pub fn edit_batch(
+        &mut self,
+        edits: impl IntoIterator<Item = (Range<usize>, String)>,
+    ) -> Vec<AppliedEdit> {
+        let mut pending: Vec<(Range<usize>, String)> = edits.into_iter().collect();
+        pending.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let applied: Vec<AppliedEdit> = pending
+            .into_iter()
+            .map(|(range, text)| self.buffer.edit(range, &text))
+            .collect();
+        self.history.record_step(applied.clone());
+        self.content_hash = self.buffer.content_hash();
+        applied
     }
 
-    /// Redoes the most recently undone edit, if any.
-    pub fn redo(&mut self) -> Option<AppliedEdit> {
-        let edit = self.history.redo(&mut self.buffer)?;
-        self.revision += 1;
-        Some(edit)
+    /// Undoes the most recent step, if any.
+    ///
+    /// Returns the undone step; use [`UndoStep::start`] to place the caret.
+    pub fn undo(&mut self) -> Option<UndoStep> {
+        let step = self.history.undo(&mut self.buffer)?;
+        self.content_hash = self.buffer.content_hash();
+        Some(step)
+    }
+
+    /// Redoes the most recently undone step, if any.
+    pub fn redo(&mut self) -> Option<UndoStep> {
+        let step = self.history.redo(&mut self.buffer)?;
+        self.content_hash = self.buffer.content_hash();
+        Some(step)
     }
 
     /// Saves the document to its current path.
@@ -131,8 +167,8 @@ impl Document {
         let reopened = Self::open(path)?;
         self.buffer = reopened.buffer;
         self.history = History::new();
-        self.revision += 1;
-        self.saved_revision = self.revision;
+        self.content_hash = reopened.content_hash;
+        self.saved_hash = reopened.saved_hash;
         Ok(())
     }
 
@@ -157,7 +193,7 @@ impl Document {
             path: path.to_path_buf(),
             source: error.error,
         })?;
-        self.saved_revision = self.revision;
+        self.saved_hash = self.content_hash;
         Ok(())
     }
 }
@@ -227,13 +263,39 @@ mod tests {
     }
 
     #[test]
-    fn undo_and_redo_bump_revision() {
+    fn undoing_back_to_saved_content_is_clean() {
         let mut document = Document::from_text("abc");
         document.edit(3..3, "d");
-        document.undo();
-        document.redo();
-        assert_eq!(document.buffer().text(), "abcd");
         assert!(document.is_dirty());
+        document.undo();
+        assert!(!document.is_dirty());
+        document.redo();
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn editing_elsewhere_is_still_dirty() {
+        let mut document = Document::from_text("abc");
+        document.edit(0..0, "x");
+        document.undo();
+        assert!(!document.is_dirty());
+        // A different edit that happens to restore the same text is clean;
+        // a different text is dirty.
+        document.edit(0..1, "z");
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn edit_batch_applies_as_one_step() {
+        let mut document = Document::from_text("one\ntwo\n");
+        document.edit_batch(vec![(0..0, "  ".to_owned()), (4..4, "  ".to_owned())]);
+        assert_eq!(document.buffer().text(), "  one\n  two\n");
+        assert!(document.can_undo());
+
+        document.undo();
+        assert_eq!(document.buffer().text(), "one\ntwo\n");
+        assert!(!document.can_undo());
+        assert!(!document.is_dirty());
     }
 
     #[test]

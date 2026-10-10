@@ -3,6 +3,8 @@
 
 use std::ops::Range;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 /// A row/column point in bytes, mirroring `tree_sitter::Point`.
 ///
 /// Syntax highlighting needs to tell tree-sitter where an edit happened so
@@ -89,25 +91,68 @@ impl AppliedEdit {
         self.range.start..self.range.start + self.inserted.len()
     }
 
-    /// Returns `true` if `self` and `next` are consecutive single-character
-    /// insertions that should collapse into one undo step.
+    /// Returns `true` if this edit is a single-grapheme insertion or
+    /// deletion, i.e. eligible to be part of a coalescing run.
+    pub(crate) fn is_single_grapheme_edit(&self) -> bool {
+        match self.kind {
+            EditKind::Insert => self.removed.is_empty() && is_single_grapheme(&self.inserted),
+            EditKind::Delete => self.inserted.is_empty() && is_single_grapheme(&self.removed),
+            EditKind::Replace => false,
+        }
+    }
+
+    /// Returns `true` if `self` and `next` are adjacent edits of the same
+    /// kind that may collapse into one undo step.
     ///
-    /// This is what makes typing feel right: pressing `a``b``c` should undo
-    /// as one unit, while `a`, arrow key, `b` should not.
+    /// Whether a step is *open* to further coalescing is tracked by the
+    /// history; this only checks the geometry.
     pub(crate) fn can_coalesce(&self, next: &AppliedEdit) -> bool {
-        self.is_insert()
-            && next.is_insert()
-            && self.removed.is_empty()
-            && next.removed.is_empty()
-            // `next` starts exactly where `self`'s insertion ended.
-            && self.range.start + self.inserted.len() == next.range.start
-            // Single-grapheme-ish insertions only; pasting stays atomic.
-            && next.inserted.chars().count() == 1
+        match (self.kind, next.kind) {
+            (EditKind::Insert, EditKind::Insert) => {
+                self.removed.is_empty()
+                    && next.removed.is_empty()
+                    && self.range.start + self.inserted.len() == next.range.start
+            }
+            (EditKind::Delete, EditKind::Delete) => {
+                self.inserted.is_empty()
+                    && next.inserted.is_empty()
+                    // Backward run (backspace): the newer edit sits directly
+                    // before the step. Forward run (delete): both edits start
+                    // at the same offset.
+                    && (next.range.end == self.range.start
+                        || next.range.start == self.range.start)
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn coalesce_with(&mut self, next: AppliedEdit) {
-        self.inserted.push_str(&next.inserted);
-        self.summary.new_end_byte = next.summary.new_end_byte;
-        self.summary.new_end_position = next.summary.new_end_position;
+        match (self.kind, next.kind) {
+            (EditKind::Insert, EditKind::Insert) => {
+                self.inserted.push_str(&next.inserted);
+                self.summary.new_end_byte = next.summary.new_end_byte;
+                self.summary.new_end_position = next.summary.new_end_position;
+            }
+            (EditKind::Delete, EditKind::Delete) => {
+                if next.range.end == self.range.start {
+                    // Backward run: prepend the newer deletion.
+                    self.range.start = next.range.start;
+                    self.removed = next.removed + &self.removed;
+                    self.summary.start_byte = next.summary.start_byte;
+                    self.summary.start_position = next.summary.start_position;
+                } else {
+                    // Forward run: append the newer deletion.
+                    self.range.end = next.range.end;
+                    self.removed.push_str(&next.removed);
+                    self.summary.old_end_byte = next.summary.old_end_byte;
+                    self.summary.old_end_position = next.summary.old_end_position;
+                }
+            }
+            _ => {}
+        }
     }
+}
+
+fn is_single_grapheme(text: &str) -> bool {
+    text.graphemes(true).count() == 1
 }
