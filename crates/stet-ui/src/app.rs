@@ -91,6 +91,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", InsertNewline, None),
         // Application.
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
+        KeyBinding::new("cmd-f", OpenFind, None),
+        KeyBinding::new("cmd-alt-f", OpenFindReplace, None),
+        KeyBinding::new("shift-enter", FindPrevious, None),
+        KeyBinding::new("cmd-alt-c", ToggleFindCase, None),
         KeyBinding::new("escape", Dismiss, None),
         KeyBinding::new("cmd-q", QuitEditor, None),
     ]

@@ -6,6 +6,7 @@
 //! The palette, when open, intercepts the editing actions and routes them to
 //! its own state instead of the editor.
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui::prelude::*;
@@ -14,10 +15,11 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, PromptLevel, SharedString, Window, div, px,
     rgba, uniform_list,
 };
-use stet_core::Document;
+use stet_core::{Document, find_matches};
 
 use crate::actions::*;
 use crate::editor::{EditorView, GUTTER_WIDTH, InputAreaElement, LINE_HEIGHT, LineElement};
+use crate::find::{FindField, FindState};
 use crate::palette::{Palette, PaletteCommand};
 use crate::theme::Theme;
 
@@ -35,6 +37,7 @@ pub struct Workspace {
     tabs: Vec<Entity<EditorView>>,
     active: usize,
     palette: Palette,
+    find: FindState,
     theme: Theme,
     status_message: Option<SharedString>,
 }
@@ -56,12 +59,17 @@ impl Workspace {
         };
 
         let editor = cx.new(|cx| EditorView::new(document, theme.clone(), cx));
-        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        cx.observe(&editor, |workspace: &mut Workspace, editor, cx| {
+            workspace.on_editor_event(&editor, cx);
+            cx.notify();
+        })
+        .detach();
 
         Self {
             tabs: vec![editor],
             active: 0,
             palette: Palette::new(cx.focus_handle()),
+            find: FindState::new(cx.focus_handle(), cx.focus_handle()),
             theme,
             status_message,
         }
@@ -267,6 +275,8 @@ impl Workspace {
         if self.palette.open {
             self.palette.select_previous();
             cx.notify();
+        } else if self.find.open {
+            self.find_step(true, cx);
         } else {
             self.with_active_editor(cx, |editor, cx| editor.move_vertical(false, false, cx));
         }
@@ -276,6 +286,8 @@ impl Workspace {
         if self.palette.open {
             self.palette.select_next();
             cx.notify();
+        } else if self.find.open {
+            self.find_step(false, cx);
         } else {
             self.with_active_editor(cx, |editor, cx| editor.move_vertical(true, false, cx));
         }
@@ -381,6 +393,12 @@ impl Workspace {
         if self.palette.open {
             self.palette.backspace();
             cx.notify();
+        } else if self.find.open {
+            if self.find.backspace() {
+                self.refresh_find(true, cx);
+            } else {
+                cx.notify();
+            }
         } else {
             self.with_active_editor(cx, |editor, cx| editor.delete_backward(cx));
         }
@@ -403,6 +421,12 @@ impl Workspace {
     ) {
         if self.palette.open {
             self.run_selected_palette_command(window, cx);
+        } else if self.find.open {
+            if self.find.field == FindField::Replace {
+                self.perform_replace_current(cx);
+            } else {
+                self.find_step(false, cx);
+            }
         } else {
             self.with_active_editor(cx, |editor, cx| editor.insert_newline(cx));
         }
@@ -417,6 +441,9 @@ impl Workspace {
         if self.palette.open {
             self.close_palette(window, cx);
         } else {
+            if self.find.open {
+                self.perform_close_find(window, cx);
+            }
             self.palette.open();
             window.focus(&self.palette.focus_handle);
             cx.notify();
@@ -426,6 +453,8 @@ impl Workspace {
     fn on_dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.open {
             self.close_palette(window, cx);
+        } else if self.find.open {
+            self.perform_close_find(window, cx);
         } else {
             self.with_active_editor(cx, |editor, cx| editor.clear_selection(cx));
         }
@@ -482,7 +511,232 @@ impl Workspace {
             PaletteCommand::SelectAll => {
                 self.with_active_editor(cx, |editor, cx| editor.select_all(cx));
             }
+            PaletteCommand::Find => self.perform_open_find(false, window, cx),
+            PaletteCommand::FindReplace => self.perform_open_find(true, window, cx),
             PaletteCommand::Quit => cx.quit(),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Find and replace
+    // ---------------------------------------------------------------
+
+    /// Reacts to editor notifications: re-runs the search when the text
+    /// changed, but never when only the selection moved.
+    fn on_editor_event(&mut self, editor: &Entity<EditorView>, cx: &mut Context<Self>) {
+        if !self.find.open || editor.entity_id() != self.active_editor().entity_id() {
+            return;
+        }
+        let revision = editor.read(cx).text_revision();
+        if revision != self.find.revision {
+            self.refresh_find(false, cx);
+        }
+    }
+
+    /// Recomputes matches for the current query.
+    ///
+    /// `move_selection` is true when the user changed the query or stepped
+    /// through matches; false when the text changed underneath the bar,
+    /// where moving the caret would fight the user.
+    fn refresh_find(&mut self, move_selection: bool, cx: &mut Context<Self>) {
+        let editor = self.active_editor().clone();
+        let (revision, cursor) = {
+            let editor = editor.read(cx);
+            (editor.text_revision(), editor.selection().cursor())
+        };
+        let result = {
+            let editor = editor.read(cx);
+            find_matches(
+                editor.document().buffer(),
+                &self.find.query,
+                self.find.options(),
+            )
+        };
+        let current = result.next_index_from(cursor);
+        let current_range = current.and_then(|index| result.matches.get(index).cloned());
+        let matches = result.matches.clone();
+        self.find.revision = revision;
+        self.find.matches = result;
+        self.find.current = current;
+        self.apply_find_highlights(&editor, matches, current_range, move_selection, cx);
+    }
+
+    fn apply_find_highlights(
+        &mut self,
+        editor: &Entity<EditorView>,
+        matches: Vec<Range<usize>>,
+        current_range: Option<Range<usize>>,
+        move_selection: bool,
+        cx: &mut Context<Self>,
+    ) {
+        editor.update(cx, |editor, cx| {
+            editor.set_search(matches, current_range.clone(), cx);
+            if move_selection && let Some(range) = current_range {
+                editor.select_range(range, cx);
+            }
+        });
+    }
+
+    /// Moves to the next or previous match, wrapping around.
+    fn find_step(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        if !self.find.open || self.find.matches.is_empty() {
+            return;
+        }
+        let editor = self.active_editor().clone();
+        let cursor = {
+            let editor = editor.read(cx);
+            if backwards {
+                editor.selection().start()
+            } else {
+                editor.selection().end()
+            }
+        };
+        let index = if backwards {
+            self.find.matches.previous_index_from(cursor)
+        } else {
+            self.find.matches.next_index_from(cursor)
+        };
+        let Some(index) = index else { return };
+        self.find.current = Some(index);
+        let current_range = self.find.current_range();
+        let matches = self.find.matches.matches.clone();
+        self.apply_find_highlights(&editor, matches, current_range, true, cx);
+    }
+
+    fn focus_find_field(&mut self, field: FindField, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.field = field;
+        let focus = self.find.field_focus().clone();
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    /// Opens the find bar, optionally with the replace row focused.
+    pub fn perform_open_find(
+        &mut self,
+        replace_mode: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette.close();
+        self.find.show(replace_mode);
+        let focus = self.find.field_focus().clone();
+        window.focus(&focus);
+        if self.find.query.is_empty() {
+            let editor = self.active_editor().clone();
+            editor.update(cx, |editor, cx| editor.clear_search(cx));
+        } else {
+            self.refresh_find(true, cx);
+        }
+        cx.notify();
+    }
+
+    /// Closes the find bar and returns focus to the editor.
+    pub fn perform_close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find.open {
+            return;
+        }
+        self.find.hide();
+        let editor = self.active_editor().clone();
+        editor.update(cx, |editor, cx| editor.clear_search(cx));
+        self.focus_active_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Replaces the current match and advances to the next one.
+    fn perform_replace_current(&mut self, cx: &mut Context<Self>) {
+        let Some(range) = self.find.current_range() else {
+            return;
+        };
+        let replacement = self.find.replacement.clone();
+        let editor = self.active_editor().clone();
+        editor.update(cx, |editor, cx| {
+            editor.replace_ranges(vec![(range, replacement)], cx);
+        });
+        self.refresh_find(true, cx);
+    }
+
+    /// Replaces every match in one undo step.
+    fn perform_replace_all(&mut self, cx: &mut Context<Self>) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let replacement = self.find.replacement.clone();
+        let edits: Vec<(Range<usize>, String)> = self
+            .find
+            .matches
+            .matches
+            .iter()
+            .cloned()
+            .map(|range| (range, replacement.clone()))
+            .collect();
+        let count = edits.len();
+        let editor = self.active_editor().clone();
+        editor.update(cx, |editor, cx| {
+            editor.replace_ranges(edits, cx);
+        });
+        self.refresh_find(false, cx);
+        self.set_status(
+            format!(
+                "Replaced {count} occurrence{}",
+                if count == 1 { "" } else { "s" }
+            ),
+            cx,
+        );
+    }
+
+    /// Types into the active find field.
+    fn find_field_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.find.open {
+            return;
+        }
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.platform || modifiers.alt {
+            return;
+        }
+        let Some(text) = event.keystroke.key_char.as_deref() else {
+            return;
+        };
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return;
+        }
+        if self.find.push_str(text) {
+            self.refresh_find(true, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn on_open_find(&mut self, _: &OpenFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.perform_open_find(false, window, cx);
+    }
+
+    fn on_open_find_replace(
+        &mut self,
+        _: &OpenFindReplace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.perform_open_find(true, window, cx);
+    }
+
+    fn on_find_previous(&mut self, _: &FindPrevious, _window: &mut Window, cx: &mut Context<Self>) {
+        self.find_step(true, cx);
+    }
+
+    fn on_toggle_find_case(
+        &mut self,
+        _: &ToggleFindCase,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find.open {
+            self.find.toggle_case();
+            self.refresh_find(false, cx);
         }
     }
 
@@ -605,7 +859,11 @@ impl Workspace {
     fn new_editor(&mut self, document: Document, cx: &mut Context<Self>) -> Entity<EditorView> {
         let theme = self.theme.clone();
         let editor = cx.new(|cx| EditorView::new(document, theme, cx));
-        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        cx.observe(&editor, |workspace: &mut Workspace, editor, cx| {
+            workspace.on_editor_event(&editor, cx);
+            cx.notify();
+        })
+        .detach();
         editor
     }
 
@@ -619,7 +877,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         update: impl FnOnce(&mut EditorView, &mut Context<EditorView>),
     ) {
-        if self.palette.open {
+        if self.palette.open || self.find.open {
             return;
         }
         let editor = self.active_editor().clone();
@@ -917,6 +1175,180 @@ impl Workspace {
         bar
     }
 
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let label = self.find.match_label();
+        let case_on = self.find.case_sensitive;
+        let replace_mode = self.find.replace_mode;
+        let query = self.find.query.clone();
+        let replacement = self.find.replacement.clone();
+        let query_active = self.find.field == FindField::Query;
+        let replace_active = self.find.field == FindField::Replace;
+
+        let query_field = div()
+            .id("find-query")
+            .flex_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme.background)
+            .text_color(if query.is_empty() {
+                theme.muted
+            } else {
+                theme.foreground
+            })
+            .when(query_active, |this| {
+                this.border_1().border_color(theme.accent)
+            })
+            .track_focus(&self.find.query_focus)
+            .on_key_down(cx.listener(Self::find_field_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|workspace, _: &MouseDownEvent, window, cx| {
+                    workspace.focus_find_field(FindField::Query, window, cx);
+                }),
+            )
+            .child(if query.is_empty() {
+                SharedString::from("Find")
+            } else {
+                SharedString::from(query)
+            });
+
+        let replace_field = div()
+            .id("find-replace-input")
+            .flex_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme.background)
+            .text_color(if replacement.is_empty() {
+                theme.muted
+            } else {
+                theme.foreground
+            })
+            .when(replace_active, |this| {
+                this.border_1().border_color(theme.accent)
+            })
+            .track_focus(&self.find.replace_focus)
+            .on_key_down(cx.listener(Self::find_field_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|workspace, _: &MouseDownEvent, window, cx| {
+                    workspace.focus_find_field(FindField::Replace, window, cx);
+                }),
+            )
+            .child(if replacement.is_empty() {
+                SharedString::from("Replace")
+            } else {
+                SharedString::from(replacement)
+            });
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .flex_shrink_0()
+            .bg(theme.surface_raised)
+            .text_color(theme.foreground)
+            .border_b_1()
+            .border_color(theme.border)
+            .text_sm()
+            .child(query_field)
+            .children((!label.is_empty()).then(|| {
+                div()
+                    .text_color(theme.muted)
+                    .child(SharedString::from(label))
+            }))
+            .child(
+                div()
+                    .id("find-case")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(if case_on { theme.accent } else { theme.muted })
+                    .hover(|this| this.bg(theme.background.opacity(0.6)))
+                    .on_click(cx.listener(|workspace, _: &ClickEvent, _window, cx| {
+                        if workspace.find.open {
+                            workspace.find.toggle_case();
+                            workspace.refresh_find(false, cx);
+                        }
+                    }))
+                    .child("Aa"),
+            )
+            .child(
+                div()
+                    .id("find-previous")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme.background.opacity(0.6)))
+                    .on_click(cx.listener(|workspace, _: &ClickEvent, _window, cx| {
+                        workspace.find_step(true, cx);
+                    }))
+                    .child("↑"),
+            )
+            .child(
+                div()
+                    .id("find-next")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme.background.opacity(0.6)))
+                    .on_click(cx.listener(|workspace, _: &ClickEvent, _window, cx| {
+                        workspace.find_step(false, cx);
+                    }))
+                    .child("↓"),
+            )
+            .when(replace_mode, |this| {
+                this.child(replace_field)
+                    .child(
+                        div()
+                            .id("find-replace")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(theme.background.opacity(0.6)))
+                            .on_click(cx.listener(|workspace, _: &ClickEvent, _window, cx| {
+                                workspace.perform_replace_current(cx);
+                            }))
+                            .child("Replace"),
+                    )
+                    .child(
+                        div()
+                            .id("find-replace-all")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(theme.background.opacity(0.6)))
+                            .on_click(cx.listener(|workspace, _: &ClickEvent, _window, cx| {
+                                workspace.perform_replace_all(cx);
+                            }))
+                            .child("All"),
+                    )
+            })
+            .child(
+                div()
+                    .id("find-close")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme.background.opacity(0.6)))
+                    .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
+                        workspace.perform_close_find(window, cx);
+                    }))
+                    .child("×"),
+            )
+    }
+
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = self.theme.clone();
         let commands = self.palette.filtered();
@@ -1003,6 +1435,7 @@ impl gpui::Render for Workspace {
         let theme = self.theme.clone();
         let editor = self.active_editor().clone();
         let editor_area = self.render_editor(editor, cx);
+        let find_bar = self.find.open.then(|| self.render_find_bar(cx));
         let palette = self.palette.open.then(|| self.render_palette(cx));
 
         div()
@@ -1046,12 +1479,111 @@ impl gpui::Render for Workspace {
             .on_action(cx.listener(Self::on_delete_forward))
             .on_action(cx.listener(Self::on_insert_newline))
             .on_action(cx.listener(Self::on_toggle_palette))
+            .on_action(cx.listener(Self::on_open_find))
+            .on_action(cx.listener(Self::on_open_find_replace))
+            .on_action(cx.listener(Self::on_find_previous))
+            .on_action(cx.listener(Self::on_toggle_find_case))
             .on_action(cx.listener(Self::on_dismiss))
             .on_action(cx.listener(Self::on_quit))
             .child(self.render_toolbar(cx))
             .child(self.render_tabs(cx))
+            .children(find_bar)
             .child(editor_area)
             .child(self.render_status_bar(cx))
             .children(palette)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(None, cx));
+        (workspace, cx)
+    }
+
+    fn seed(workspace: &Entity<Workspace>, text: &str, cx: &mut VisualTestContext) {
+        workspace.update(cx, |workspace, cx| {
+            let editor = workspace.active_editor().clone();
+            editor.update(cx, |editor, cx| editor.insert_plain(text, cx));
+        });
+    }
+
+    fn selection(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> std::ops::Range<usize> {
+        workspace.update(cx, |workspace, cx| {
+            let editor = workspace.active_editor().clone();
+            editor.update(cx, |editor, _cx| editor.selection().range())
+        })
+    }
+
+    fn text(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+        workspace.update(cx, |workspace, cx| {
+            let editor = workspace.active_editor().clone();
+            editor.update(cx, |editor, _cx| editor.document().buffer().text())
+        })
+    }
+
+    #[gpui::test]
+    fn find_selects_matches_and_steps(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        seed(&workspace, "one two one", cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.perform_open_find(false, window, cx);
+            workspace.find.query = "one".to_owned();
+            workspace.refresh_find(true, cx);
+        });
+        assert_eq!(selection(&workspace, cx), 0..3);
+
+        workspace.update(cx, |workspace, cx| workspace.find_step(false, cx));
+        assert_eq!(selection(&workspace, cx), 8..11);
+        workspace.update(cx, |workspace, cx| workspace.find_step(false, cx));
+        assert_eq!(selection(&workspace, cx), 0..3);
+        workspace.update(cx, |workspace, cx| workspace.find_step(true, cx));
+        assert_eq!(selection(&workspace, cx), 8..11);
+    }
+
+    #[gpui::test]
+    fn replace_all_is_one_undo_step(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        seed(&workspace, "one two one", cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.perform_open_find(true, window, cx);
+            workspace.find.query = "one".to_owned();
+            workspace.find.replacement = "1".to_owned();
+            workspace.refresh_find(false, cx);
+            workspace.perform_replace_all(cx);
+        });
+        assert_eq!(text(&workspace, cx), "1 two 1");
+
+        workspace.update(cx, |workspace, cx| {
+            let editor = workspace.active_editor().clone();
+            editor.update(cx, |editor, cx| editor.undo(cx));
+        });
+        assert_eq!(text(&workspace, cx), "one two one");
+    }
+
+    #[gpui::test]
+    fn case_toggle_changes_matches(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        seed(&workspace, "One one", cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.perform_open_find(false, window, cx);
+            workspace.find.query = "one".to_owned();
+            workspace.refresh_find(false, cx);
+        });
+        let insensitive = workspace.update(cx, |workspace, _cx| workspace.find.matches.len());
+        assert_eq!(insensitive, 2);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.find.toggle_case();
+            workspace.refresh_find(false, cx);
+        });
+        let sensitive = workspace.update(cx, |workspace, _cx| workspace.find.matches.len());
+        assert_eq!(sensitive, 1);
     }
 }

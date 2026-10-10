@@ -97,6 +97,10 @@ pub struct Theme {
     pub border: Hsla,
     /// Selection highlight.
     pub selection: Hsla,
+    /// Find-match highlight.
+    pub search_match: Hsla,
+    /// Highlight for the match the find bar is currently on.
+    pub search_current: Hsla,
     /// Caret color.
     pub caret: Hsla,
     /// Line number color.
@@ -119,6 +123,8 @@ impl Theme {
             accent: c(0x4c8dff),
             border: c(0x343a45),
             selection: ca(0x3d64c880),
+            search_match: ca(0x4c8dff40),
+            search_current: ca(0xf0a44c66),
             caret: c(0xe6e9ee),
             gutter: c(0x5c6470),
             gutter_active: c(0xaab2bf),

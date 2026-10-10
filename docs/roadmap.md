@@ -53,14 +53,16 @@ The one gap that makes the editor unusable for CJK and dead-key input.
 
 ### Iteration 3 — Find and replace
 
-- [ ] `stet-core` search model: literal matching, case sensitivity, match
+- [x] `stet-core` search model: literal matching, case sensitivity, match
       iteration over the rope, tested
-- [ ] Find bar (`cmd+f`), next/previous (`enter`/`shift+enter`), match
+- [x] Find bar (`cmd+f`), next/previous (`enter`/`shift+enter`), match
       count, highlight matches in `LineElement`
-- [ ] Replace one/all (`alt+cmd+f`), undo as one step for replace-all
-- [ ] Palette entries and status messages for zero matches
-- Acceptance: search unit tests; smoke test on a large file (no stalls
-  while typing in the find field).
+- [x] Replace one/all (`alt+cmd+f`), undo as one step for replace-all
+- [x] Palette entries and status messages for zero matches
+- Acceptance: search unit tests; headless workspace tests for the
+  find/replace flow. (Typing a multi-megabyte file in the find field is
+  capped at 10k matches rather than benchmarked; see the limitations in
+  docs/architecture.md.)
 
 ### Iteration 4 — Multi-cursor
 

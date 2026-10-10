@@ -64,6 +64,7 @@ crates/stet-ui     GPUI layer
   src/workspace.rs tabs, toolbar, status bar, palette, action handlers
   src/editor.rs    EditorView state + LineElement custom element
   src/palette.rs   palette state and filtering
+  src/find.rs      find/replace bar state
   src/theme.rs     colors
   src/actions.rs   actions! vocabulary
 docs/adr           decision records (one file per decision)

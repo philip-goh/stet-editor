@@ -29,6 +29,10 @@ pub enum PaletteCommand {
     Redo,
     /// Select all.
     SelectAll,
+    /// Open the find bar.
+    Find,
+    /// Open the find and replace bar.
+    FindReplace,
     /// Quit.
     Quit,
 }
@@ -46,6 +50,8 @@ impl PaletteCommand {
         PaletteCommand::Undo,
         PaletteCommand::Redo,
         PaletteCommand::SelectAll,
+        PaletteCommand::Find,
+        PaletteCommand::FindReplace,
         PaletteCommand::Quit,
     ];
 
@@ -62,6 +68,8 @@ impl PaletteCommand {
             PaletteCommand::Undo => "Edit: Undo",
             PaletteCommand::Redo => "Edit: Redo",
             PaletteCommand::SelectAll => "Edit: Select All",
+            PaletteCommand::Find => "Edit: Find",
+            PaletteCommand::FindReplace => "Edit: Find and Replace",
             PaletteCommand::Quit => "Application: Quit",
         }
     }

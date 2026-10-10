@@ -22,6 +22,7 @@
 pub mod actions;
 pub mod app;
 pub mod editor;
+pub mod find;
 pub mod palette;
 pub mod theme;
 pub mod workspace;
@@ -29,6 +30,7 @@ pub mod workspace;
 pub use actions::*;
 pub use app::launch;
 pub use editor::EditorView;
+pub use find::{FindField, FindState};
 pub use palette::{Palette, PaletteCommand};
 pub use theme::Theme;
 pub use workspace::Workspace;

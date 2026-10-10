@@ -80,6 +80,14 @@ actions!(
         InsertNewline,
         /// Toggles the command palette.
         TogglePalette,
+        /// Opens the find bar.
+        OpenFind,
+        /// Opens the find bar with the replace row.
+        OpenFindReplace,
+        /// Moves to the previous find match.
+        FindPrevious,
+        /// Toggles case sensitivity in the find bar.
+        ToggleFindCase,
         /// Dismisses the command palette or clears the selection.
         Dismiss,
         /// Quits the editor.

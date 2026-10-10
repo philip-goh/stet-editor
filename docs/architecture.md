@@ -33,9 +33,12 @@ Everything that is true independent of a screen lives here:
 - `Document` — buffer + path + content-hash dirty state + undo history +
   atomic save. UTF-8 only for now (BOM stripped), line endings preserved.
 - `Selection` — anchor/head byte offsets. The head is the caret.
+- `search` — literal matching over the rope with case options, match
+  navigation and a hard cap, returning plain byte ranges. The find bar is
+  a thin state holder on top of it.
 - `History` — undo/redo over `UndoStep`s: one or more `AppliedEdit`s that
   undo together. Insertion and deletion runs coalesce; batched operations
-  (block indent, and later multi-cursor typing and replace-all) record a
+  (block indent, replace-all, and later multi-cursor typing) record a
   transaction so they undo as one unit.
 
 Rules of the layer:
@@ -124,6 +127,8 @@ The two planned escape hatches, in order:
 Tracked in the [roadmap](roadmap.md), listed here so nobody mistakes them
 for bugs:
 
-- No multi-cursor, no find/replace, no line wrapping.
+- No multi-cursor, no line wrapping.
+- Find is literal, single-line and capped at 10k matches; no regex or
+  whole-word modes yet.
 - Highlighting is synchronous and size-limited.
 - No settings file; the action list is static.

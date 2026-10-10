@@ -62,6 +62,13 @@ pub struct EditorView {
     dragging: bool,
     /// The byte range of in-progress IME composition (preedit) text, if any.
     marked_range: Option<Range<usize>>,
+    /// Bumped whenever the text changes (not on selection moves). Used by
+    /// the find bar to avoid re-searching on every repaint.
+    text_revision: u64,
+    /// Byte ranges of find matches, sorted and non-overlapping.
+    search_matches: Vec<Range<usize>>,
+    /// The match the find bar is currently on, if any.
+    current_match: Option<Range<usize>>,
     theme: Theme,
 }
 
@@ -84,6 +91,9 @@ impl EditorView {
             line_layouts: HashMap::new(),
             dragging: false,
             marked_range: None,
+            text_revision: 0,
+            search_matches: Vec::new(),
+            current_match: None,
             theme,
         }
     }
@@ -99,6 +109,9 @@ impl EditorView {
         self.desired_column = None;
         self.line_layouts.clear();
         self.marked_range = None;
+        self.search_matches.clear();
+        self.current_match = None;
+        self.text_revision += 1;
         self.highlighter.refresh(&self.document.buffer().text());
     }
 
@@ -622,6 +635,86 @@ impl EditorView {
         }
     }
 
+    /// Returns the number of times the text has changed.
+    ///
+    /// Selection moves do not bump this; find-in-editor uses it to avoid
+    /// re-searching on every repaint.
+    pub fn text_revision(&self) -> u64 {
+        self.text_revision
+    }
+
+    /// Replaces the find highlights without moving the selection.
+    pub fn set_search(
+        &mut self,
+        matches: Vec<Range<usize>>,
+        current: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_matches = matches;
+        self.current_match = current;
+        cx.notify();
+    }
+
+    /// Clears find highlights.
+    pub fn clear_search(&mut self, cx: &mut Context<Self>) {
+        if !self.search_matches.is_empty() || self.current_match.is_some() {
+            self.search_matches.clear();
+            self.current_match = None;
+            cx.notify();
+        }
+    }
+
+    /// Selects `range` and scrolls it into view.
+    pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        self.selection = Selection::region(range.start, range.end);
+        self.desired_column = None;
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    /// Applies replacement edits as a single undo step.
+    pub fn replace_ranges(&mut self, edits: Vec<(Range<usize>, String)>, cx: &mut Context<Self>) {
+        if edits.is_empty() {
+            return;
+        }
+        let first = edits
+            .iter()
+            .map(|(range, _)| range.start)
+            .min()
+            .unwrap_or(0);
+        self.document.edit_batch(edits);
+        self.selection.collapse_to(first);
+        self.desired_column = None;
+        self.refresh(cx);
+    }
+
+    /// Returns the find highlights intersecting `line_start..line_end` as
+    /// line-relative ranges, each flagged if it is the current match.
+    pub fn search_highlights_for_line(
+        &self,
+        line_start: usize,
+        line_end: usize,
+    ) -> Vec<(Range<usize>, bool)> {
+        if self.search_matches.is_empty() || line_start >= line_end {
+            return Vec::new();
+        }
+        let first = self
+            .search_matches
+            .partition_point(|range| range.end <= line_start);
+        let mut highlights = Vec::new();
+        for range in &self.search_matches[first..] {
+            if range.start >= line_end {
+                break;
+            }
+            let start = range.start.max(line_start) - line_start;
+            let end = range.end.min(line_end) - line_start;
+            if start < end {
+                highlights.push((start..end, self.current_match.as_ref() == Some(range)));
+            }
+        }
+        highlights
+    }
+
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         let buffer = self.document.buffer();
         buffer.byte_to_utf16(range.start)..buffer.byte_to_utf16(range.end)
@@ -643,6 +736,7 @@ impl EditorView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.text_revision += 1;
         self.highlighter.refresh(&self.document.buffer().text());
         self.ensure_cursor_visible();
         cx.notify();
@@ -882,6 +976,7 @@ impl Element for InputAreaElement {
 /// The prepaint output of a [`LineElement`].
 pub(crate) struct LinePrepaint {
     shaped: Option<ShapedLine>,
+    search: Vec<PaintQuad>,
     selection: Option<PaintQuad>,
     caret: Option<PaintQuad>,
 }
@@ -987,9 +1082,30 @@ impl Element for LineElement {
             line_start,
             line_end,
         );
+        let search = editor
+            .search_highlights_for_line(line_start, line_end)
+            .into_iter()
+            .map(|(range, current)| {
+                let x0 = shaped.x_for_index(range.start.min(content_len));
+                let x1 = shaped.x_for_index(range.end.min(content_len));
+                let color = if current {
+                    editor.theme().search_current
+                } else {
+                    editor.theme().search_match
+                };
+                fill(
+                    Bounds::new(
+                        point(bounds.left() + x0, bounds.top()),
+                        size(x1 - x0, bounds.size.height),
+                    ),
+                    color,
+                )
+            })
+            .collect();
 
         LinePrepaint {
             shaped: Some(shaped),
+            search,
             selection: selection_quad,
             caret: caret_quad,
         }
@@ -1005,6 +1121,10 @@ impl Element for LineElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        for quad in prepaint.search.drain(..) {
+            window.paint_quad(quad);
+        }
+
         if let Some(quad) = prepaint.selection.take() {
             window.paint_quad(quad);
         }

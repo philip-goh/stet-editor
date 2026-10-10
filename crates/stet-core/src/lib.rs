@@ -28,6 +28,7 @@ mod edit;
 mod error;
 mod history;
 mod position;
+mod search;
 mod selection;
 mod text;
 
@@ -36,5 +37,6 @@ pub use edit::{AppliedEdit, EditKind, EditSummary, Point};
 pub use error::{Error, Result};
 pub use history::{History, UndoStep};
 pub use position::Position;
+pub use search::{MAX_MATCHES, SearchOptions, SearchResult, find_matches};
 pub use selection::Selection;
 pub use text::{LineEnding, TextBuffer};
