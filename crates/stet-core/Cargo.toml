@@ -1,0 +1,17 @@
+[package]
+name = "stet-core"
+description = "UI-agnostic text engine for the Stet editor: buffers, edits, selections and documents."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ropey.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+unicode-segmentation.workspace = true

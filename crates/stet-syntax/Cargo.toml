@@ -1,0 +1,19 @@
+[package]
+name = "stet-syntax"
+description = "Tree-sitter based syntax highlighting for the Stet editor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tree-sitter.workspace = true
+tree-sitter-highlight.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-toml-ng.workspace = true

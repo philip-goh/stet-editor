@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Keep routine bumps in one PR to reduce review noise.
+      patch-and-minor:
+        applies-to: version-updates
+        update-types: [patch, minor]
+    ignore:
+      # GPUI is pinned exactly; upgrades are deliberate and require smoke
+      # testing. See docs/adr/0003-gui-framework-gpui.md.
+      - dependency-name: gpui
+      - dependency-name: gpui_*
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

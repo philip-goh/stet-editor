@@ -1,0 +1,77 @@
+# Stet editor workspace.
+#
+# The workspace is split into a UI-agnostic core (`stet-core`), supporting
+# services (`stet-syntax`, `stet-plugin`) and the GPUI-based user interface
+# (`stet-ui`). The binary in `apps/stet` wires everything together.
+#
+# Dependency direction is strictly:
+#
+#     apps/stet -> stet-ui -> { stet-core, stet-syntax, stet-plugin }
+#     stet-syntax -> stet-core
+#
+# `stet-core` must never depend on a UI crate. See docs/adr/0002.
+[workspace]
+resolver = "3"
+members = ["apps/stet", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/philip-goh/stet-editor"
+authors = ["Philip Goh"]
+
+[workspace.dependencies]
+# Internal crates.
+stet-core = { version = "0.1.0", path = "crates/stet-core" }
+stet-plugin = { version = "0.1.0", path = "crates/stet-plugin" }
+stet-syntax = { version = "0.1.0", path = "crates/stet-syntax" }
+stet-ui = { version = "0.1.0", path = "crates/stet-ui" }
+
+# UI.
+gpui = "0.2.2"
+futures = "0.3"
+
+# Text engine.
+ropey = "1.6.1"
+unicode-segmentation = "1"
+
+# Syntax highlighting.
+tree-sitter = "0.27.1"
+tree-sitter-highlight = "0.27.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-toml-ng = "0.7.0"
+
+# Plugins.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+semver = { version = "1.0", features = ["serde"] }
+
+# Errors and testing.
+anyhow = "1.0"
+thiserror = "2.0"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# A GUI app spends most of its time in dependencies; optimize them even in
+# debug builds so the editor feels responsive while developing.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

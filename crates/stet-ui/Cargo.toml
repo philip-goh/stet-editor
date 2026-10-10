@@ -1,0 +1,27 @@
+[package]
+name = "stet-ui"
+description = "GPUI user interface for the Stet editor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# GPUI normally compiles its Metal shaders at build time with `xcrun metal`,
+# which requires a full Xcode install. With this feature the shaders are
+# compiled by the OS at startup instead, so the editor builds on machines
+# with only Command Line Tools. Disable with `--no-default-features` when
+# building with full Xcode.
+default = ["runtime-shaders"]
+runtime-shaders = ["gpui/runtime_shaders"]
+
+[lints]
+workspace = true
+
+[dependencies]
+stet-core.workspace = true
+stet-plugin.workspace = true
+stet-syntax.workspace = true
+gpui.workspace = true
+futures.workspace = true
