@@ -32,7 +32,10 @@ Everything that is true independent of a screen lives here:
   how to undo the change and how tree-sitter should adjust its parse.
 - `Document` — buffer + path + content-hash dirty state + undo history +
   atomic save. UTF-8 only for now (BOM stripped), line endings preserved.
-- `Selection` — anchor/head byte offsets. The head is the caret.
+- `SelectionSet` — an ordered set of anchor/head selections, kept sorted
+  and non-overlapping, with `map_ranges_through_edits` for computing
+  post-edit carets. This is what makes multi-cursor editing a batch of
+  ordinary edits that undo as one step.
 - `search` — literal matching over the rope with case options, match
   navigation and a hard cap, returning plain byte ranges. The find bar is
   a thin state holder on top of it.
@@ -127,7 +130,7 @@ The two planned escape hatches, in order:
 Tracked in the [roadmap](roadmap.md), listed here so nobody mistakes them
 for bugs:
 
-- No multi-cursor, no line wrapping.
+- No line wrapping.
 - Find is literal, single-line and capped at 10k matches; no regex or
   whole-word modes yet.
 - Highlighting is synchronous and size-limited.

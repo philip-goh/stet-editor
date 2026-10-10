@@ -55,7 +55,7 @@ crates/stet-core   buffer/text engine (no UI), all unit-tested
   src/text.rs      TextBuffer: rope, positions, graphemes, words, edits
   src/document.rs  Document: path, dirty state, atomic save, history
   src/history.rs   undo/redo with typing coalescing
-  src/selection.rs anchor/head byte selection
+  src/selection.rs anchor/head selections + multi-cursor SelectionSet
   src/edit.rs      AppliedEdit + tree-sitter EditSummary
 crates/stet-syntax Language enum + Highlighter (tree-sitter, per-line cache)
 crates/stet-plugin PluginManifest + Host/Plugin traits (WASM ABI contracts)

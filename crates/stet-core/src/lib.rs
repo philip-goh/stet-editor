@@ -38,5 +38,5 @@ pub use error::{Error, Result};
 pub use history::{History, UndoStep};
 pub use position::Position;
 pub use search::{MAX_MATCHES, SearchOptions, SearchResult, find_matches};
-pub use selection::Selection;
+pub use selection::{Replacement, Selection, SelectionSet, map_ranges_through_edits};
 pub use text::{LineEnding, TextBuffer};

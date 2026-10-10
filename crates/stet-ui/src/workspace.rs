@@ -384,6 +384,33 @@ impl Workspace {
         self.with_active_editor(cx, |editor, cx| editor.move_document_end(false, cx));
     }
 
+    fn on_select_next_occurrence(
+        &mut self,
+        _: &SelectNextOccurrence,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_active_editor(cx, |editor, cx| editor.select_next_occurrence(cx));
+    }
+
+    fn on_add_cursor_above(
+        &mut self,
+        _: &AddCursorAbove,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_active_editor(cx, |editor, cx| editor.add_cursor_vertical(false, cx));
+    }
+
+    fn on_add_cursor_below(
+        &mut self,
+        _: &AddCursorBelow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_active_editor(cx, |editor, cx| editor.add_cursor_vertical(true, cx));
+    }
+
     fn on_delete_backward(
         &mut self,
         _: &DeleteBackward,
@@ -1144,6 +1171,12 @@ impl Workspace {
         let (line, column) = editor.cursor_status();
         let language = editor.language().display_name();
         let name = editor.document().display_name();
+        let cursor_count = editor.selections().len();
+        let position = if cursor_count > 1 {
+            format!("{cursor_count} cursors")
+        } else {
+            format!("Ln {line}, Col {column}")
+        };
 
         let mut bar = div()
             .flex()
@@ -1165,7 +1198,7 @@ impl Workspace {
                     .flex_row()
                     .gap_3()
                     .child(SharedString::from(language.to_string()))
-                    .child(SharedString::from(format!("Ln {line}, Col {column}"))),
+                    .child(SharedString::from(position)),
             );
 
         if let Some(message) = self.status_message.clone() {
@@ -1475,6 +1508,9 @@ impl gpui::Render for Workspace {
             .on_action(cx.listener(Self::on_move_line_end))
             .on_action(cx.listener(Self::on_move_document_start))
             .on_action(cx.listener(Self::on_move_document_end))
+            .on_action(cx.listener(Self::on_select_next_occurrence))
+            .on_action(cx.listener(Self::on_add_cursor_above))
+            .on_action(cx.listener(Self::on_add_cursor_below))
             .on_action(cx.listener(Self::on_delete_backward))
             .on_action(cx.listener(Self::on_delete_forward))
             .on_action(cx.listener(Self::on_insert_newline))

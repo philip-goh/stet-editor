@@ -22,7 +22,10 @@ use gpui::{
     UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window, fill, point, px, relative,
     size,
 };
-use stet_core::{Document, Position, Selection};
+use stet_core::{
+    Document, Position, Replacement, SearchOptions, Selection, SelectionSet,
+    map_ranges_through_edits,
+};
 use stet_syntax::{Highlighter, Language};
 
 use crate::theme::{SyntaxTheme, Theme};
@@ -48,7 +51,7 @@ pub(crate) struct LineLayout {
 /// Per-tab editor state.
 pub struct EditorView {
     document: Document,
-    selection: Selection,
+    selections: SelectionSet,
     /// Remembered char column for vertical movement.
     desired_column: Option<usize>,
     highlighter: Highlighter,
@@ -82,7 +85,7 @@ impl EditorView {
         highlighter.refresh(&document.buffer().text());
         Self {
             document,
-            selection: Selection::collapsed_at(0),
+            selections: SelectionSet::new(Selection::collapsed_at(0)),
             desired_column: None,
             highlighter,
             focus_handle: cx.focus_handle(),
@@ -105,7 +108,7 @@ impl EditorView {
             .map_or(Language::PlainText, Language::from_path);
         self.highlighter.set_language(language);
         self.document = document;
-        self.selection = Selection::collapsed_at(0);
+        self.selections.set_single(Selection::collapsed_at(0));
         self.desired_column = None;
         self.line_layouts.clear();
         self.marked_range = None;
@@ -145,9 +148,25 @@ impl EditorView {
         self.highlighter.language()
     }
 
-    /// Returns the current selection.
+    /// Returns the primary selection.
+    ///
+    /// The primary is the first selection after normalization; it drives the
+    /// status bar, IME and single-selection operations.
     pub fn selection(&self) -> Selection {
-        self.selection
+        *self.selections.primary()
+    }
+
+    /// Returns all selections.
+    pub fn selections(&self) -> &SelectionSet {
+        &self.selections
+    }
+
+    /// Replaces all selections and notifies.
+    pub fn set_selections(&mut self, selections: Vec<Selection>, cx: &mut Context<Self>) {
+        self.selections = SelectionSet::from_selections(selections);
+        self.desired_column = None;
+        self.ensure_cursor_visible();
+        cx.notify();
     }
 
     /// Returns `true` while a drag selection is in progress.
@@ -179,7 +198,7 @@ impl EditorView {
     pub fn cursor_line(&self) -> usize {
         self.document
             .buffer()
-            .offset_to_position(self.selection.cursor())
+            .offset_to_position(self.selection().cursor())
             .line
     }
 
@@ -189,7 +208,7 @@ impl EditorView {
         let position = self
             .document
             .buffer()
-            .offset_to_position(self.selection.cursor());
+            .offset_to_position(self.selection().cursor());
         (position.line + 1, position.column + 1)
     }
 
@@ -228,23 +247,28 @@ impl EditorView {
         None
     }
 
-    /// Inserts user-typed `text`, replacing the selection.
+    /// Inserts user-typed `text`, replacing the selections.
     ///
-    /// Typed text gets editor affordances: closing brackets and quote pairs
-    /// are inserted around a collapsed caret, wrap an active selection, and
-    /// typing a closing character next to its match skips over it.
-    /// Programmatic insertion (pasting, IME commits) uses
-    /// [`EditorView::insert_plain`] instead.
+    /// Typed text gets editor affordances for a single selection: closing
+    /// brackets and quote pairs are inserted around a collapsed caret, wrap
+    /// an active selection, and typing a closing character next to its match
+    /// skips over it. Multi-cursor typing takes the plain path.
+    /// Programmatic insertion (pasting, IME commits) also uses
+    /// [`EditorView::insert_plain`].
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        if self.selection.is_empty() {
+        if self.selections.is_multi() {
+            self.insert_plain(text, cx);
+            return;
+        }
+        if self.selection().is_empty() {
             // Typing the character that is already ahead of the caret moves
             // over it instead of doubling it.
             if is_skippable(text) {
-                let cursor = self.selection.cursor();
+                let cursor = self.selection().cursor();
                 let buffer = self.document.buffer();
                 let next = buffer.next_grapheme_boundary(cursor);
                 if buffer.slice(cursor..next) == text {
-                    self.selection.collapse_to(next);
+                    self.selections.set_single(Selection::collapsed_at(next));
                     cx.notify();
                     return;
                 }
@@ -253,22 +277,24 @@ impl EditorView {
                 // Don't auto-close quotes in the middle of a word
                 // ("don't"). Brackets always pair.
                 if !(is_quote(text) && self.previous_char_is_word()) {
-                    let at = self.selection.cursor();
+                    let at = self.selection().cursor();
                     let edit = self.document.edit(at..at, &format!("{text}{close}"));
-                    self.selection.collapse_to(edit.range.start + text.len());
+                    self.selections
+                        .set_single(Selection::collapsed_at(edit.range.start + text.len()));
                     self.desired_column = None;
                     self.refresh(cx);
                     return;
                 }
             }
         } else if let Some(close) = matching_close_for(text) {
-            let range = self.selection.range();
+            let range = self.selection().range();
             let selected = self.document.buffer().slice(range.clone());
             let edit = self
                 .document
                 .edit(range, &format!("{text}{selected}{close}"));
             let start = edit.range.start + text.len();
-            self.selection = Selection::region(start, start + selected.len());
+            self.selections
+                .set_single(Selection::region(start, start + selected.len()));
             self.desired_column = None;
             self.refresh(cx);
             return;
@@ -277,22 +303,33 @@ impl EditorView {
         self.insert_plain(text, cx);
     }
 
-    /// Inserts `text`, replacing the selection, with no automatic pairs.
+    /// Inserts `text` into every selection, with no automatic pairs.
+    ///
+    /// The whole batch is one undo step, and each caret ends up after its
+    /// own insertion.
     pub fn insert_plain(&mut self, text: &str, cx: &mut Context<Self>) {
-        let range = self.selection.range();
-        if text.is_empty() && range.is_empty() {
+        let ranges = self.selections.ranges();
+        if text.is_empty() && ranges.iter().all(Range::is_empty) {
             return;
         }
-        let edit = self.document.edit(range, text);
-        self.selection.collapse_to(edit.range.start + text.len());
-        self.desired_column = None;
-        self.refresh(cx);
+        let replacements: Vec<Replacement> = ranges
+            .iter()
+            .map(|range| Replacement {
+                range: range.clone(),
+                new_len: text.len(),
+            })
+            .collect();
+        let edits: Vec<(Range<usize>, String)> = ranges
+            .iter()
+            .map(|range| (range.clone(), text.to_owned()))
+            .collect();
+        self.apply_edits(edits, &replacements, true, cx);
     }
 
-    /// Returns `true` if the char immediately before the caret is a word
-    /// character.
+    /// Returns `true` if the char immediately before the primary caret is a
+    /// word character.
     fn previous_char_is_word(&self) -> bool {
-        let cursor = self.selection.cursor();
+        let cursor = self.selection().cursor();
         if cursor == 0 {
             return false;
         }
@@ -305,164 +342,283 @@ impl EditorView {
             .is_some_and(|character| character.is_alphanumeric() || character == '_')
     }
 
-    /// Inserts a line break, copying the current line's leading whitespace.
+    /// Inserts a line break into every selection, copying each line's
+    /// leading whitespace.
     pub fn insert_newline(&mut self, cx: &mut Context<Self>) {
-        let (newline, indent) = {
-            let buffer = self.document.buffer();
-            let position = buffer.offset_to_position(self.selection.cursor());
-            let line_content = buffer.line_content(position.line);
-            let indent: String = line_content
-                .chars()
-                .take_while(|c| *c == ' ' || *c == '\t')
-                .collect();
-            (buffer.line_ending().as_str(), indent)
-        };
-        self.insert_text(&format!("{newline}{indent}"), cx);
-    }
-
-    /// Deletes the previous grapheme, or the selection.
-    pub fn delete_backward(&mut self, cx: &mut Context<Self>) {
-        let range = if self.selection.is_empty() {
-            let previous = self
-                .document
-                .buffer()
-                .prev_grapheme_boundary(self.selection.cursor());
-            previous..self.selection.cursor()
-        } else {
-            self.selection.range()
-        };
-        if range.is_empty() {
-            return;
-        }
-        let edit = self.document.edit(range, "");
-        self.selection.collapse_to(edit.range.start);
-        self.desired_column = None;
-        self.refresh(cx);
-    }
-
-    /// Deletes the next grapheme, or the selection.
-    pub fn delete_forward(&mut self, cx: &mut Context<Self>) {
-        let range = if self.selection.is_empty() {
-            let next = self
-                .document
-                .buffer()
-                .next_grapheme_boundary(self.selection.cursor());
-            self.selection.cursor()..next
-        } else {
-            self.selection.range()
-        };
-        if range.is_empty() {
-            return;
-        }
-        let edit = self.document.edit(range, "");
-        self.selection.collapse_to(edit.range.start);
-        self.desired_column = None;
-        self.refresh(cx);
-    }
-
-    /// Moves the caret one grapheme horizontally.
-    pub fn move_horizontal(&mut self, right: bool, extend: bool, cx: &mut Context<Self>) {
-        let cursor = self.selection.cursor();
-        let buffer = self.document.buffer();
-        let target = if right {
-            buffer.next_grapheme_boundary(cursor)
-        } else {
-            buffer.prev_grapheme_boundary(cursor)
-        };
-        self.desired_column = None;
-        self.move_to(target, extend, cx);
-    }
-
-    /// Moves the caret one line vertically, restoring the desired column.
-    pub fn move_vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
-        let (last_line, desired, target) = {
-            let buffer = self.document.buffer();
-            let current = buffer.offset_to_position(self.selection.cursor());
-            let desired = self.desired_column.unwrap_or(current.column);
-            let last_line = buffer.line_count().saturating_sub(1);
-            let target_line = if down {
-                (current.line + 1).min(last_line)
-            } else {
-                current.line.saturating_sub(1)
+        let ranges = self.selections.ranges();
+        let mut edits = Vec::with_capacity(ranges.len());
+        let mut replacements = Vec::with_capacity(ranges.len());
+        for range in &ranges {
+            let (newline, indent) = {
+                let buffer = self.document.buffer();
+                let position = buffer.offset_to_position(range.end);
+                let line_content = buffer.line_content(position.line);
+                let indent: String = line_content
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+                (buffer.line_ending().as_str(), indent)
             };
-            (
-                last_line,
-                desired,
-                buffer.position_to_offset(Position::new(target_line, desired)),
-            )
-        };
-        if last_line == 0 {
+            let text = format!("{newline}{indent}");
+            replacements.push(Replacement {
+                range: range.clone(),
+                new_len: text.len(),
+            });
+            edits.push((range.clone(), text));
+        }
+        self.apply_edits(edits, &replacements, true, cx);
+    }
+
+    /// Deletes the previous grapheme, or the selection, in every selection.
+    pub fn delete_backward(&mut self, cx: &mut Context<Self>) {
+        let ranges: Vec<Range<usize>> = self
+            .selections
+            .iter()
+            .map(|selection| {
+                if selection.is_empty() {
+                    let buffer = self.document.buffer();
+                    buffer.prev_grapheme_boundary(selection.cursor())..selection.cursor()
+                } else {
+                    selection.range()
+                }
+            })
+            .collect();
+        self.delete_ranges(ranges, cx);
+    }
+
+    /// Deletes the next grapheme, or the selection, in every selection.
+    pub fn delete_forward(&mut self, cx: &mut Context<Self>) {
+        let ranges: Vec<Range<usize>> = self
+            .selections
+            .iter()
+            .map(|selection| {
+                if selection.is_empty() {
+                    let buffer = self.document.buffer();
+                    selection.cursor()..buffer.next_grapheme_boundary(selection.cursor())
+                } else {
+                    selection.range()
+                }
+            })
+            .collect();
+        self.delete_ranges(ranges, cx);
+    }
+
+    fn delete_ranges(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        // Adjacent cursors can produce overlapping delete ranges; normalize
+        // through a selection set before applying.
+        let normalized = SelectionSet::from_selections(
+            ranges
+                .into_iter()
+                .filter(|range| !range.is_empty())
+                .map(|range| Selection::region(range.start, range.end))
+                .collect(),
+        );
+        let ranges = normalized.ranges();
+        if ranges.is_empty() || ranges.iter().all(Range::is_empty) {
             return;
         }
-        self.desired_column = Some(desired);
-        self.move_to(target, extend, cx);
+        let replacements: Vec<Replacement> = ranges
+            .iter()
+            .map(|range| Replacement {
+                range: range.clone(),
+                new_len: 0,
+            })
+            .collect();
+        let edits: Vec<(Range<usize>, String)> = ranges
+            .iter()
+            .map(|range| (range.clone(), String::new()))
+            .collect();
+        self.apply_edits(edits, &replacements, false, cx);
     }
 
-    /// Moves the caret one word horizontally.
+    /// Applies a batch of edits and recomputes the selections.
+    ///
+    /// `collapse_to_end` puts each caret after its replacement (typing);
+    /// otherwise it goes before it (deleting).
+    fn apply_edits(
+        &mut self,
+        edits: Vec<(Range<usize>, String)>,
+        replacements: &[Replacement],
+        collapse_to_end: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if edits.is_empty() {
+            return;
+        }
+        let ranges: Vec<Range<usize>> = replacements
+            .iter()
+            .map(|replacement| replacement.range.clone())
+            .collect();
+        self.document.edit_batch(edits);
+        let mapped = map_ranges_through_edits(&ranges, replacements);
+        self.selections = SelectionSet::from_selections(
+            mapped
+                .into_iter()
+                .map(|range| {
+                    Selection::collapsed_at(if collapse_to_end {
+                        range.end
+                    } else {
+                        range.start
+                    })
+                })
+                .collect(),
+        );
+        self.desired_column = None;
+        self.refresh(cx);
+    }
+
+    /// Moves every caret one grapheme horizontally.
+    pub fn move_horizontal(&mut self, right: bool, extend: bool, cx: &mut Context<Self>) {
+        let moves: Vec<Selection> = {
+            let buffer = self.document.buffer();
+            self.selections
+                .iter()
+                .map(|selection| {
+                    let target = if right {
+                        buffer.next_grapheme_boundary(selection.cursor())
+                    } else {
+                        buffer.prev_grapheme_boundary(selection.cursor())
+                    };
+                    moved(selection, target, extend)
+                })
+                .collect()
+        };
+        self.set_selections(moves, cx);
+    }
+
+    /// Moves every caret one line vertically.
+    ///
+    /// With a single caret the desired column is remembered across short
+    /// lines; with multiple carets each uses its current column.
+    pub fn move_vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
+        let single = !self.selections.is_multi();
+        let mut next_desired = None;
+        let moves: Vec<Selection> = {
+            let buffer = self.document.buffer();
+            let last_line = buffer.line_count().saturating_sub(1);
+            self.selections
+                .iter()
+                .map(|selection| {
+                    let current = buffer.offset_to_position(selection.cursor());
+                    let column = if single {
+                        self.desired_column.unwrap_or(current.column)
+                    } else {
+                        current.column
+                    };
+                    if single {
+                        next_desired = Some(column);
+                    }
+                    let target_line = if down {
+                        (current.line + 1).min(last_line)
+                    } else {
+                        current.line.saturating_sub(1)
+                    };
+                    let target = buffer.position_to_offset(Position::new(target_line, column));
+                    moved(selection, target, extend)
+                })
+                .collect()
+        };
+        self.selections = SelectionSet::from_selections(moves);
+        self.desired_column = next_desired;
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    /// Moves every caret one word horizontally.
     pub fn move_word(&mut self, right: bool, extend: bool, cx: &mut Context<Self>) {
-        let cursor = self.selection.cursor();
-        let buffer = self.document.buffer();
-        let target = if right {
-            buffer.next_word_boundary(cursor)
-        } else {
-            buffer.prev_word_boundary(cursor)
+        let moves: Vec<Selection> = {
+            let buffer = self.document.buffer();
+            self.selections
+                .iter()
+                .map(|selection| {
+                    let cursor = selection.cursor();
+                    let target = if right {
+                        buffer.next_word_boundary(cursor)
+                    } else {
+                        buffer.prev_word_boundary(cursor)
+                    };
+                    moved(selection, target, extend)
+                })
+                .collect()
         };
-        self.desired_column = None;
-        self.move_to(target, extend, cx);
+        self.set_selections(moves, cx);
     }
 
-    /// Moves the caret to the start of its line.
+    /// Moves every caret to the start of its line.
+    ///
+    /// Home toggles between the first non-whitespace char and column 0.
     pub fn move_line_start(&mut self, extend: bool, cx: &mut Context<Self>) {
-        let line = self.cursor_line();
-        // Home toggles between the first non-whitespace char and column 0.
-        let line_start = self.line_start_offset(line);
-        let content = self.line_content(line);
-        let first_non_ws = content
-            .char_indices()
-            .find(|(_, c)| !c.is_whitespace())
-            .map_or(0, |(index, _)| index);
-        let target = if self.selection.cursor() == line_start + first_non_ws {
-            line_start
-        } else {
-            line_start + first_non_ws
+        let moves: Vec<Selection> = {
+            let buffer = self.document.buffer();
+            self.selections
+                .iter()
+                .map(|selection| {
+                    let line = buffer.offset_to_position(selection.cursor()).line;
+                    let line_start = buffer.line_start_offset(line);
+                    let content = buffer.line_content(line);
+                    let first_non_ws = content
+                        .char_indices()
+                        .find(|(_, character)| !character.is_whitespace())
+                        .map_or(0, |(index, _)| index);
+                    let target = if selection.cursor() == line_start + first_non_ws {
+                        line_start
+                    } else {
+                        line_start + first_non_ws
+                    };
+                    moved(selection, target, extend)
+                })
+                .collect()
         };
-        self.desired_column = None;
-        self.move_to(target, extend, cx);
+        self.set_selections(moves, cx);
     }
 
-    /// Moves the caret to the end of its line.
+    /// Moves every caret to the end of its line.
     pub fn move_line_end(&mut self, extend: bool, cx: &mut Context<Self>) {
-        let line = self.cursor_line();
-        let buffer = self.document.buffer();
-        let target = buffer.line_end_offset(line);
-        self.desired_column = None;
-        self.move_to(target, extend, cx);
+        let moves: Vec<Selection> = {
+            let buffer = self.document.buffer();
+            self.selections
+                .iter()
+                .map(|selection| {
+                    let line = buffer.offset_to_position(selection.cursor()).line;
+                    let target = buffer.line_end_offset(line);
+                    moved(selection, target, extend)
+                })
+                .collect()
+        };
+        self.set_selections(moves, cx);
     }
 
-    /// Moves the caret to the start of the document.
+    /// Moves every caret to the start of the document.
     pub fn move_document_start(&mut self, extend: bool, cx: &mut Context<Self>) {
-        self.desired_column = None;
-        self.move_to(0, extend, cx);
+        let moves: Vec<Selection> = self
+            .selections
+            .iter()
+            .map(|selection| moved(selection, 0, extend))
+            .collect();
+        self.set_selections(moves, cx);
     }
 
-    /// Moves the caret to the end of the document.
+    /// Moves every caret to the end of the document.
     pub fn move_document_end(&mut self, extend: bool, cx: &mut Context<Self>) {
-        self.desired_column = None;
         let end = self.document.buffer().len_bytes();
-        self.move_to(end, extend, cx);
+        let moves: Vec<Selection> = self
+            .selections
+            .iter()
+            .map(|selection| moved(selection, end, extend))
+            .collect();
+        self.set_selections(moves, cx);
     }
 
     /// Selects the entire document.
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         let end = self.document.buffer().len_bytes();
-        self.selection = Selection::region(0, end);
+        self.selections.set_single(Selection::region(0, end));
         cx.notify();
     }
 
-    /// Collapses the selection to the caret, if it is not already empty.
+    /// Collapses every selection to one caret.
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        if !self.selection.is_empty() {
-            self.selection.collapse_to(self.selection.cursor());
+        if self.selections.collapse_to_primary() {
             cx.notify();
         }
     }
@@ -470,7 +626,8 @@ impl EditorView {
     /// Undoes the most recent edit.
     pub fn undo(&mut self, cx: &mut Context<Self>) {
         if let Some(step) = self.document.undo() {
-            self.selection.collapse_to(step.start());
+            self.selections
+                .set_single(Selection::collapsed_at(step.start()));
             self.desired_column = None;
             self.refresh(cx);
         }
@@ -479,30 +636,29 @@ impl EditorView {
     /// Redoes the most recently undone edit.
     pub fn redo(&mut self, cx: &mut Context<Self>) {
         if let Some(step) = self.document.redo() {
-            self.selection.collapse_to(step.start());
+            self.selections
+                .set_single(Selection::collapsed_at(step.start()));
             self.desired_column = None;
             self.refresh(cx);
         }
     }
 
-    /// Copies the selection to the system clipboard.
+    /// Copies the primary selection to the system clipboard.
     pub fn copy(&mut self, cx: &mut Context<Self>) {
-        if self.selection.is_empty() {
+        if self.selection().is_empty() {
             return;
         }
-        let text = self.document.buffer().slice(self.selection.range());
+        let text = self.document.buffer().slice(self.selection().range());
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
-    /// Cuts the selection to the system clipboard.
+    /// Cuts the primary selection to the system clipboard.
     pub fn cut(&mut self, cx: &mut Context<Self>) {
-        if self.selection.is_empty() {
+        if self.selection().is_empty() {
             return;
         }
         self.copy(cx);
-        let edit = self.document.edit(self.selection.range(), "");
-        self.selection.collapse_to(edit.range.start);
-        self.refresh(cx);
+        self.delete_ranges(vec![self.selection().range()], cx);
     }
 
     /// Pastes the clipboard over the selection.
@@ -521,8 +677,8 @@ impl EditorView {
     pub fn indent(&mut self, outdent: bool, cx: &mut Context<Self>) {
         let unit = self.document.buffer().indent_unit();
 
-        if self.selection.is_empty() {
-            let cursor = self.selection.cursor();
+        if self.selection().is_empty() {
+            let cursor = self.selection().cursor();
             let line = self.document.buffer().offset_to_position(cursor).line;
             let line_start = self.document.buffer().line_start_offset(line);
             if outdent {
@@ -533,10 +689,12 @@ impl EditorView {
                 }
                 let edit = self.document.edit(line_start..line_start + prefix, "");
                 let new_cursor = cursor.saturating_sub(prefix).max(edit.range.start);
-                self.selection.collapse_to(new_cursor);
+                self.selections
+                    .set_single(Selection::collapsed_at(new_cursor));
             } else {
                 let edit = self.document.edit(line_start..line_start, &unit);
-                self.selection.collapse_to(edit.range.start + unit.len());
+                self.selections
+                    .set_single(Selection::collapsed_at(edit.range.start + unit.len()));
             }
             self.desired_column = None;
             self.refresh(cx);
@@ -545,11 +703,11 @@ impl EditorView {
 
         let (first_line, last_line) = {
             let buffer = self.document.buffer();
-            let first = buffer.offset_to_position(self.selection.start()).line;
-            let mut last = buffer.offset_to_position(self.selection.end()).line;
+            let first = buffer.offset_to_position(self.selection().start()).line;
+            let mut last = buffer.offset_to_position(self.selection().end()).line;
             // A selection ending exactly at a line start does not include
             // that line.
-            if self.selection.end() == buffer.line_start_offset(last) && last > first {
+            if self.selection().end() == buffer.line_start_offset(last) && last > first {
                 last -= 1;
             }
             (first, last)
@@ -575,10 +733,10 @@ impl EditorView {
 
         self.document.edit_batch(edits);
         let buffer = self.document.buffer();
-        self.selection = Selection::region(
+        self.selections.set_single(Selection::region(
             buffer.line_start_offset(first_line),
             buffer.line_end_offset(last_line),
-        );
+        ));
         self.desired_column = None;
         self.refresh(cx);
     }
@@ -598,19 +756,24 @@ impl EditorView {
         match click_count {
             2 => {
                 let range = self.document.buffer().word_range_at(byte);
-                self.selection = Selection::region(range.start, range.end);
+                self.selections
+                    .set_single(Selection::region(range.start, range.end));
             }
             count if count >= 3 => {
                 let buffer = self.document.buffer();
                 let line = buffer.offset_to_position(byte).line;
-                self.selection =
-                    Selection::region(buffer.line_start_offset(line), buffer.line_end_offset(line));
+                self.selections.set_single(Selection::region(
+                    buffer.line_start_offset(line),
+                    buffer.line_end_offset(line),
+                ));
             }
             _ => {
                 if extend {
-                    self.selection.select_to(byte);
+                    let mut selection = self.selection();
+                    selection.select_to(byte);
+                    self.selections.set_single(selection);
                 } else {
-                    self.selection.collapse_to(byte);
+                    self.selections.set_single(Selection::collapsed_at(byte));
                 }
             }
         }
@@ -622,7 +785,9 @@ impl EditorView {
 
     /// Extends an in-progress mouse selection to `byte`.
     pub fn extend_selection(&mut self, byte: usize, cx: &mut Context<Self>) {
-        self.selection.select_to(byte);
+        let mut selection = self.selection();
+        selection.select_to(byte);
+        self.selections.set_single(selection);
         self.ensure_cursor_visible();
         cx.notify();
     }
@@ -666,7 +831,8 @@ impl EditorView {
 
     /// Selects `range` and scrolls it into view.
     pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        self.selection = Selection::region(range.start, range.end);
+        self.selections
+            .set_single(Selection::region(range.start, range.end));
         self.desired_column = None;
         self.ensure_cursor_visible();
         cx.notify();
@@ -683,9 +849,131 @@ impl EditorView {
             .min()
             .unwrap_or(0);
         self.document.edit_batch(edits);
-        self.selection.collapse_to(first);
+        self.selections.set_single(Selection::collapsed_at(first));
         self.desired_column = None;
         self.refresh(cx);
+    }
+
+    /// Selects the next occurrence of the primary selection's text.
+    ///
+    /// With a collapsed caret this selects the word under it (the first
+    /// `cmd+d`). With a selection it adds the next non-overlapping
+    /// occurrence after the primary, case-sensitively, without wrapping —
+    /// pressing the shortcut again keeps adding occurrences.
+    pub fn select_next_occurrence(&mut self, cx: &mut Context<Self>) {
+        let primary = self.selection();
+        if primary.is_empty() {
+            let range = self.document.buffer().word_range_at(primary.cursor());
+            if range.is_empty() {
+                return;
+            }
+            self.selections
+                .set_single(Selection::region(range.start, range.end));
+            self.ensure_cursor_visible();
+            cx.notify();
+            return;
+        }
+
+        let needle = self.document.buffer().slice(primary.range());
+        if needle.is_empty() {
+            return;
+        }
+        let result = stet_core::find_matches(
+            self.document.buffer(),
+            &needle,
+            SearchOptions {
+                case_sensitive: true,
+            },
+        );
+        let existing = self.selections.ranges();
+        let found = result
+            .matches
+            .iter()
+            .filter(|range| range.start >= primary.end())
+            .find(|range| {
+                !existing
+                    .iter()
+                    .any(|current| current.start < range.end && range.start < current.end)
+            })
+            .cloned();
+        if let Some(range) = found {
+            self.selections
+                .add(Selection::region(range.start, range.end));
+            self.ensure_cursor_visible();
+            cx.notify();
+        }
+    }
+
+    /// Adds a caret one line above or below the outermost caret.
+    pub fn add_cursor_vertical(&mut self, down: bool, cx: &mut Context<Self>) {
+        let reference = if down {
+            self.selections
+                .iter()
+                .max_by_key(|selection| selection.start())
+                .copied()
+        } else {
+            self.selections
+                .iter()
+                .min_by_key(|selection| selection.start())
+                .copied()
+        };
+        let Some(reference) = reference else { return };
+
+        let target = {
+            let buffer = self.document.buffer();
+            let position = buffer.offset_to_position(reference.cursor());
+            let last_line = buffer.line_count().saturating_sub(1);
+            let target_line = if down {
+                (position.line + 1).min(last_line)
+            } else {
+                position.line.saturating_sub(1)
+            };
+            if target_line == position.line {
+                return;
+            }
+            buffer.position_to_offset(Position::new(target_line, position.column))
+        };
+        self.selections.add(Selection::collapsed_at(target));
+        self.desired_column = None;
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    /// Returns the non-empty selections intersecting a line as
+    /// line-relative byte ranges.
+    pub fn selections_for_line(&self, line_start: usize, line_end: usize) -> Vec<Range<usize>> {
+        if line_start >= line_end {
+            return Vec::new();
+        }
+        self.selections
+            .iter()
+            .filter_map(|selection| {
+                if selection.is_empty()
+                    || selection.start() > line_end
+                    || selection.end() < line_start
+                {
+                    return None;
+                }
+                let start = selection.start().max(line_start) - line_start;
+                let end = selection.end().min(line_end) - line_start;
+                (start < end).then_some(start..end)
+            })
+            .collect()
+    }
+
+    /// Returns the carets on a line as line-relative byte offsets.
+    pub fn carets_for_line(&self, line_start: usize, line_end: usize) -> Vec<usize> {
+        self.selections
+            .iter()
+            .filter_map(|selection| {
+                let caret = selection.cursor();
+                if caret >= line_start && caret <= line_end {
+                    Some(caret - line_start)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Returns the find highlights intersecting `line_start..line_end` as
@@ -723,16 +1011,6 @@ impl EditorView {
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
         let buffer = self.document.buffer();
         buffer.utf16_to_byte(range.start)..buffer.utf16_to_byte(range.end)
-    }
-
-    fn move_to(&mut self, offset: usize, extend: bool, cx: &mut Context<Self>) {
-        if extend {
-            self.selection.select_to(offset);
-        } else {
-            self.selection.collapse_to(offset);
-        }
-        self.ensure_cursor_visible();
-        cx.notify();
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -782,8 +1060,8 @@ impl EntityInputHandler for EditorView {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selection.range()),
-            reversed: self.selection.head < self.selection.anchor,
+            range: self.range_to_utf16(&self.selection().range()),
+            reversed: self.selection().head < self.selection().anchor,
         })
     }
 
@@ -818,10 +1096,10 @@ impl EntityInputHandler for EditorView {
         let range = range_utf16
             .map(|range| self.range_from_utf16(&range))
             .or_else(|| self.marked_range.clone())
-            .unwrap_or_else(|| self.selection.range());
+            .unwrap_or_else(|| self.selection().range());
         let edit = self.document.edit(range, new_text);
-        self.selection
-            .collapse_to(edit.range.start + new_text.len());
+        self.selections
+            .set_single(Selection::collapsed_at(edit.range.start + new_text.len()));
         self.marked_range = None;
         self.desired_column = None;
         self.refresh(cx);
@@ -838,18 +1116,18 @@ impl EntityInputHandler for EditorView {
         let range = range_utf16
             .map(|range| self.range_from_utf16(&range))
             .or_else(|| self.marked_range.clone())
-            .unwrap_or_else(|| self.selection.range());
+            .unwrap_or_else(|| self.selection().range());
         let edit = self.document.edit(range, new_text);
         let start = edit.range.start;
         let end = start + new_text.len();
         self.marked_range = (!new_text.is_empty()).then_some(start..end);
-        self.selection = match new_selected_range_utf16 {
+        self.selections.set_single(match new_selected_range_utf16 {
             Some(selected) => Selection::region(
                 start + utf16_to_byte_in(new_text, selected.start),
                 start + utf16_to_byte_in(new_text, selected.end),
             ),
             None => Selection::region(end, end),
-        };
+        });
         self.desired_column = None;
         self.refresh(cx);
     }
@@ -977,8 +1255,8 @@ impl Element for InputAreaElement {
 pub(crate) struct LinePrepaint {
     shaped: Option<ShapedLine>,
     search: Vec<PaintQuad>,
-    selection: Option<PaintQuad>,
-    caret: Option<PaintQuad>,
+    selections: Vec<PaintQuad>,
+    carets: Vec<PaintQuad>,
 }
 
 /// A custom element that renders one line of the document.
@@ -1063,25 +1341,20 @@ impl Element for LineElement {
                 .text_system()
                 .shape_line(SharedString::from(content), font_size, &runs, None);
 
-        let selection = editor.selection();
-        let selection_quad = selection_quad(
-            &shaped,
-            bounds,
-            editor.theme(),
-            selection,
-            line_start,
-            line_end,
-            content_len,
-        );
-        let caret_quad = caret_quad(
-            &shaped,
-            bounds,
-            editor.theme(),
-            editor.focus_handle().is_focused(window),
-            selection,
-            line_start,
-            line_end,
-        );
+        let selections: Vec<PaintQuad> = editor
+            .selections_for_line(line_start, line_end)
+            .into_iter()
+            .filter_map(|range| selection_quad(&shaped, bounds, editor.theme(), range))
+            .collect();
+        let carets: Vec<PaintQuad> = if editor.focus_handle().is_focused(window) {
+            editor
+                .carets_for_line(line_start, line_end)
+                .into_iter()
+                .map(|index| caret_quad(&shaped, bounds, editor.theme(), index))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let search = editor
             .search_highlights_for_line(line_start, line_end)
             .into_iter()
@@ -1106,8 +1379,8 @@ impl Element for LineElement {
         LinePrepaint {
             shaped: Some(shaped),
             search,
-            selection: selection_quad,
-            caret: caret_quad,
+            selections,
+            carets,
         }
     }
 
@@ -1125,7 +1398,7 @@ impl Element for LineElement {
             window.paint_quad(quad);
         }
 
-        if let Some(quad) = prepaint.selection.take() {
+        for quad in prepaint.selections.drain(..) {
             window.paint_quad(quad);
         }
 
@@ -1134,7 +1407,7 @@ impl Element for LineElement {
             let _ = line.paint(bounds.origin, px(LINE_HEIGHT), window, cx);
         }
 
-        if let Some(quad) = prepaint.caret.take() {
+        for quad in prepaint.carets.drain(..) {
             window.paint_quad(quad);
         }
 
@@ -1143,6 +1416,18 @@ impl Element for LineElement {
                 editor.record_line_layout(self.line, LineLayout { bounds, shaped });
             });
         }
+    }
+}
+
+/// Returns the selection after moving its caret to `target`.
+fn moved(selection: &Selection, target: usize, extend: bool) -> Selection {
+    if extend {
+        Selection {
+            anchor: selection.anchor,
+            head: target,
+        }
+    } else {
+        Selection::collapsed_at(target)
     }
 }
 
@@ -1265,25 +1550,13 @@ fn selection_quad(
     shaped: &ShapedLine,
     bounds: Bounds<Pixels>,
     theme: &Theme,
-    selection: Selection,
-    line_start: usize,
-    line_end: usize,
-    content_len: usize,
+    range: Range<usize>,
 ) -> Option<PaintQuad> {
-    if selection.is_empty() || selection.start() > line_end || selection.end() < line_start {
+    if range.is_empty() {
         return None;
     }
-    let start = selection.start().max(line_start) - line_start;
-    let end = if selection.end() >= line_end {
-        content_len
-    } else {
-        selection.end() - line_start
-    };
-    if start >= end {
-        return None;
-    }
-    let x0 = shaped.x_for_index(start);
-    let x1 = shaped.x_for_index(end);
+    let x0 = shaped.x_for_index(range.start);
+    let x1 = shaped.x_for_index(range.end);
     Some(fill(
         Bounds::new(
             point(bounds.left() + x0, bounds.top()),
@@ -1297,26 +1570,16 @@ fn caret_quad(
     shaped: &ShapedLine,
     bounds: Bounds<Pixels>,
     theme: &Theme,
-    focused: bool,
-    selection: Selection,
-    line_start: usize,
-    line_end: usize,
-) -> Option<PaintQuad> {
-    if !focused {
-        return None;
-    }
-    let caret = selection.cursor();
-    if caret < line_start || caret > line_end {
-        return None;
-    }
-    let x = shaped.x_for_index(caret - line_start);
-    Some(fill(
+    index: usize,
+) -> PaintQuad {
+    let x = shaped.x_for_index(index);
+    fill(
         Bounds::new(
             point(bounds.left() + x, bounds.top()),
             size(px(2.), bounds.size.height),
         ),
         theme.caret,
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -1438,5 +1701,129 @@ mod tests {
             editor.text_for_range(1..3, &mut None, window, cx)
         });
         assert_eq!(text.as_deref(), Some("😀"));
+    }
+
+    fn setup_with<'a>(
+        text: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<EditorView>, &'a mut VisualTestContext) {
+        let (_root, cx) = cx.add_window_view(|_window, _cx| TestRoot);
+        let editor = cx.new(|cx| EditorView::new(Document::from_text(text), Theme::dark(), cx));
+        (editor, cx)
+    }
+
+    #[gpui::test]
+    fn multi_cursor_typing_is_one_undo_step(cx: &mut TestAppContext) {
+        let (editor, cx) = setup_with("one\ntwo\nthree", cx);
+        editor.update(cx, |editor, cx| {
+            editor.set_selections(
+                vec![
+                    Selection::collapsed_at(0),
+                    Selection::collapsed_at(4),
+                    Selection::collapsed_at(8),
+                ],
+                cx,
+            );
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "x", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "xone\nxtwo\nxthree");
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selections().len()),
+            3
+        );
+
+        editor.update(cx, |editor, cx| editor.undo(cx));
+        assert_eq!(text_of(&editor, cx), "one\ntwo\nthree");
+    }
+
+    #[gpui::test]
+    fn multi_cursor_backspace_deletes_one_grapheme_each(cx: &mut TestAppContext) {
+        let (editor, cx) = setup_with("a\nb\nc", cx);
+        editor.update(cx, |editor, cx| {
+            editor.set_selections(
+                vec![
+                    Selection::collapsed_at(1),
+                    Selection::collapsed_at(3),
+                    Selection::collapsed_at(5),
+                ],
+                cx,
+            );
+        });
+        editor.update(cx, |editor, cx| editor.delete_backward(cx));
+        assert_eq!(text_of(&editor, cx), "\n\n");
+
+        editor.update(cx, |editor, cx| editor.undo(cx));
+        assert_eq!(text_of(&editor, cx), "a\nb\nc");
+    }
+
+    #[gpui::test]
+    fn select_next_occurrence_adds_matches(cx: &mut TestAppContext) {
+        let (editor, cx) = setup_with("one two one", cx);
+        editor.update(cx, |editor, cx| {
+            editor.set_selections(vec![Selection::collapsed_at(1)], cx);
+        });
+        editor.update(cx, |editor, cx| editor.select_next_occurrence(cx));
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selections().ranges()),
+            vec![0..3]
+        );
+
+        editor.update(cx, |editor, cx| editor.select_next_occurrence(cx));
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selections().ranges()),
+            vec![0..3, 8..11]
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "1", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "1 two 1");
+    }
+
+    #[gpui::test]
+    fn add_cursor_vertical_stacks_carets(cx: &mut TestAppContext) {
+        let (editor, cx) = setup_with("aa\nbb\ncc", cx);
+        editor.update(cx, |editor, cx| editor.add_cursor_vertical(true, cx));
+        editor.update(cx, |editor, cx| editor.add_cursor_vertical(true, cx));
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selections().ranges()),
+            vec![0..0, 3..3, 6..6]
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "x", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "xaa\nxbb\nxcc");
+    }
+
+    #[gpui::test]
+    fn carets_for_line_ignores_other_lines(cx: &mut TestAppContext) {
+        // Regression: a caret on line 0 must not underflow when asked about
+        // line 2 (the eager `then_some` version panicked).
+        let (editor, cx) = setup_with("aa\nbb\ncc", cx);
+        let (carets_here, carets_other) = editor.update(cx, |editor, _cx| {
+            (editor.carets_for_line(0, 2), editor.carets_for_line(6, 8))
+        });
+        assert_eq!(carets_here, vec![0]);
+        assert!(carets_other.is_empty());
+    }
+
+    #[gpui::test]
+    fn clear_selection_collapses_multiple_cursors(cx: &mut TestAppContext) {
+        let (editor, cx) = setup_with("one two one", cx);
+        editor.update(cx, |editor, cx| {
+            editor.set_selections(vec![Selection::region(0, 3), Selection::region(8, 11)], cx);
+        });
+        editor.update(cx, |editor, cx| editor.clear_selection(cx));
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selections().len()),
+            1
+        );
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selection().cursor()),
+            3
+        );
     }
 }

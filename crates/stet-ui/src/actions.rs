@@ -72,6 +72,12 @@ actions!(
         MoveDocumentStart,
         /// Moves the caret to the end of the document.
         MoveDocumentEnd,
+        /// Selects the next occurrence of the current selection.
+        SelectNextOccurrence,
+        /// Adds a caret one line above.
+        AddCursorAbove,
+        /// Adds a caret one line below.
+        AddCursorBelow,
         /// Deletes the previous grapheme or the selection.
         DeleteBackward,
         /// Deletes the next grapheme or the selection.

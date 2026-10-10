@@ -16,6 +16,7 @@ built to grow a real plugin ecosystem.
 - Real IME support: CJK composition, dead keys, preedit rendering
 - Tree-sitter syntax highlighting (Rust, JavaScript, JSON, TOML)
 - Auto-closing brackets and quotes, word/line selection, block indent
+- Multi-cursor editing with `⌘D` and `⌘⌥↑`/`⌘⌥↓`, one-step undo
 - Find and replace with case toggle and single-step replace-all
 - Tabs, command palette, status bar
 - Atomic file saves, UTF-8 BOM handling, LF/CRLF preservation

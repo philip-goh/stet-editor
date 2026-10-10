@@ -82,6 +82,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-right", MoveLineEnd, None),
         KeyBinding::new("cmd-up", MoveDocumentStart, None),
         KeyBinding::new("cmd-down", MoveDocumentEnd, None),
+        // Multi-cursor.
+        KeyBinding::new("cmd-d", SelectNextOccurrence, None),
+        KeyBinding::new("cmd-alt-up", AddCursorAbove, None),
+        KeyBinding::new("cmd-alt-down", AddCursorBelow, None),
         // Indentation.
         KeyBinding::new("tab", Indent, None),
         KeyBinding::new("shift-tab", Outdent, None),

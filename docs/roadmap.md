@@ -66,12 +66,13 @@ The one gap that makes the editor unusable for CJK and dead-key input.
 
 ### Iteration 4 — Multi-cursor
 
-- [ ] `SelectionSet` in core: normalized ranges, batch edit application
+- [x] `SelectionSet` in core: normalized ranges, batch edit application
       with offset mapping, tested
-- [ ] `cmd+d` select next occurrence, `cmd+alt+up/down` add cursor
-- [ ] Render multiple carets/selections; escape collapses to primary
-- Acceptance: core mapping tests; smoke test typing with three cursors and
-  undoing the batch as one step.
+- [x] `cmd+d` select next occurrence, `cmd+alt+up/down` add cursor
+- [x] Render multiple carets/selections; escape collapses to primary
+- Acceptance: core mapping tests; headless tests type with three cursors,
+      backspace, select-next-occurrence and vertical stacking, each
+      undoing as one step.
 
 ### Iteration 5 — Highlighting at scale
 
