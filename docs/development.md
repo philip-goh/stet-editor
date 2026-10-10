@@ -43,9 +43,11 @@ the plugin contracts, `stet-ui` the GPUI shell, `apps/stet` the binary.
   word boundaries, CRLF, edits and undo. Every logic change needs a test.
 - **`stet-syntax`**: per-language tests assert on real highlighted spans.
 - **`stet-plugin`**: manifest parsing/validation tests.
-- **`stet-ui`**: no automated tests yet; the roadmap includes headless GPUI
-  tests via `gpui::test-support`. For now, UI changes must be smoke-tested
-  by running the app and describing what you did in the PR.
+- **`stet-ui`**: headless GPUI tests (`gpui/test-support`) cover typing,
+  IME composition, auto-pairs and UTF-16 ranges through the real input
+  handler. Workspace-level tests are still on the roadmap; for other UI
+  changes, smoke-test by running the app and describe what you did in the
+  PR.
 
 ## Adding a language
 

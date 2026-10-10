@@ -17,7 +17,7 @@ use gpui::{
 use stet_core::Document;
 
 use crate::actions::*;
-use crate::editor::{EditorView, GUTTER_WIDTH, LINE_HEIGHT, LineElement};
+use crate::editor::{EditorView, GUTTER_WIDTH, InputAreaElement, LINE_HEIGHT, LineElement};
 use crate::palette::{Palette, PaletteCommand};
 use crate::theme::Theme;
 
@@ -785,13 +785,14 @@ impl Workspace {
         let scroll_handle = editor.read(cx).scroll_handle().clone();
         let focus_handle = editor.read(cx).focus_handle().clone();
 
-        let editor_key = editor.clone();
+        let editor_input = editor.clone();
         let editor_down = editor.clone();
         let editor_move = editor.clone();
         let editor_up = editor.clone();
         let editor_items = editor.clone();
 
         div()
+            .relative()
             .flex()
             .flex_row()
             .flex_1()
@@ -800,14 +801,6 @@ impl Workspace {
             .text_size(px(crate::editor::FONT_SIZE))
             .track_focus(&focus_handle)
             .cursor(gpui::CursorStyle::IBeam)
-            .on_key_down(
-                cx.listener(move |workspace, event: &KeyDownEvent, _window, cx| {
-                    if workspace.palette.open {
-                        return;
-                    }
-                    editor_key.update(cx, |editor, cx| editor.handle_key_down(event, cx));
-                }),
-            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |workspace, event: &MouseDownEvent, window, cx| {
@@ -824,6 +817,19 @@ impl Workspace {
                 cx.listener(move |workspace, event: &MouseUpEvent, window, cx| {
                     workspace.editor_mouse_up(&editor_up, event, window, cx);
                 }),
+            )
+            .child(
+                // Registers the focused editor as the window's text input
+                // handler; it paints nothing and takes no hitbox.
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .w_full()
+                    .h_full()
+                    .child(InputAreaElement {
+                        editor: editor_input,
+                    }),
             )
             .child(
                 uniform_list("editor-lines", line_count, move |range, _window, cx| {

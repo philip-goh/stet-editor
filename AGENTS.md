@@ -104,8 +104,11 @@ Write an ADR in `docs/adr/`, next number, using the template in
   `crates/stet-ui/Cargo.toml`.
 - **`uniform_list` ids.** Element ids are resolved per window; lines use
   `ElementId::named_usize("line", ..)`-style ids. Keep them unique.
-- **IME is not implemented.** Typing uses `KeyEvent::key_char`; dead keys
-  and CJK composition need a real `EntityInputHandler` (roadmap M1).
+- **Text input is the input handler, not key events.** Typing, IME commits
+  and composition arrive through `EntityInputHandler` on `EditorView`
+  (`editor.rs`). Never let a `key_down` listener insert text — the platform
+  path would double it. The palette is the exception: it has no input
+  handler registered while focused, so it types via `key_char`.
 - **Palette routes actions.** When the palette is open, editing actions are
   intercepted by the workspace handlers and must not reach the editor.
 

@@ -16,15 +16,16 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Element, ElementId, Entity, FocusHandle, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, PaintQuad, Pixels, Point,
-    ScrollStrategy, ShapedLine, SharedString, Style, TextRun, UniformListScrollHandle, Window,
-    fill, point, px, relative, size,
+    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, GlobalElementId, Hsla, InspectorElementId, IntoElement,
+    LayoutId, PaintQuad, Pixels, Point, ScrollStrategy, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window, fill, point, px, relative,
+    size,
 };
 use stet_core::{Document, Position, Selection};
 use stet_syntax::{Highlighter, Language};
 
-use crate::theme::Theme;
+use crate::theme::{SyntaxTheme, Theme};
 
 /// Height of one editor line, in pixels.
 ///
@@ -59,6 +60,8 @@ pub struct EditorView {
     line_layouts: HashMap<usize, LineLayout>,
     /// Whether a mouse drag selection is in progress.
     dragging: bool,
+    /// The byte range of in-progress IME composition (preedit) text, if any.
+    marked_range: Option<Range<usize>>,
     theme: Theme,
 }
 
@@ -80,6 +83,7 @@ impl EditorView {
             visible_lines: 0..0,
             line_layouts: HashMap::new(),
             dragging: false,
+            marked_range: None,
             theme,
         }
     }
@@ -94,6 +98,7 @@ impl EditorView {
         self.selection = Selection::collapsed_at(0);
         self.desired_column = None;
         self.line_layouts.clear();
+        self.marked_range = None;
         self.highlighter.refresh(&self.document.buffer().text());
     }
 
@@ -210,8 +215,57 @@ impl EditorView {
         None
     }
 
-    /// Inserts `text`, replacing the selection.
+    /// Inserts user-typed `text`, replacing the selection.
+    ///
+    /// Typed text gets editor affordances: closing brackets and quote pairs
+    /// are inserted around a collapsed caret, wrap an active selection, and
+    /// typing a closing character next to its match skips over it.
+    /// Programmatic insertion (pasting, IME commits) uses
+    /// [`EditorView::insert_plain`] instead.
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            // Typing the character that is already ahead of the caret moves
+            // over it instead of doubling it.
+            if is_skippable(text) {
+                let cursor = self.selection.cursor();
+                let buffer = self.document.buffer();
+                let next = buffer.next_grapheme_boundary(cursor);
+                if buffer.slice(cursor..next) == text {
+                    self.selection.collapse_to(next);
+                    cx.notify();
+                    return;
+                }
+            }
+            if let Some(close) = matching_close_for(text) {
+                // Don't auto-close quotes in the middle of a word
+                // ("don't"). Brackets always pair.
+                if !(is_quote(text) && self.previous_char_is_word()) {
+                    let at = self.selection.cursor();
+                    let edit = self.document.edit(at..at, &format!("{text}{close}"));
+                    self.selection.collapse_to(edit.range.start + text.len());
+                    self.desired_column = None;
+                    self.refresh(cx);
+                    return;
+                }
+            }
+        } else if let Some(close) = matching_close_for(text) {
+            let range = self.selection.range();
+            let selected = self.document.buffer().slice(range.clone());
+            let edit = self
+                .document
+                .edit(range, &format!("{text}{selected}{close}"));
+            let start = edit.range.start + text.len();
+            self.selection = Selection::region(start, start + selected.len());
+            self.desired_column = None;
+            self.refresh(cx);
+            return;
+        }
+
+        self.insert_plain(text, cx);
+    }
+
+    /// Inserts `text`, replacing the selection, with no automatic pairs.
+    pub fn insert_plain(&mut self, text: &str, cx: &mut Context<Self>) {
         let range = self.selection.range();
         if text.is_empty() && range.is_empty() {
             return;
@@ -220,6 +274,22 @@ impl EditorView {
         self.selection.collapse_to(edit.range.start + text.len());
         self.desired_column = None;
         self.refresh(cx);
+    }
+
+    /// Returns `true` if the char immediately before the caret is a word
+    /// character.
+    fn previous_char_is_word(&self) -> bool {
+        let cursor = self.selection.cursor();
+        if cursor == 0 {
+            return false;
+        }
+        let buffer = self.document.buffer();
+        let previous = buffer.prev_grapheme_boundary(cursor);
+        buffer
+            .slice(previous..cursor)
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_alphanumeric() || character == '_')
     }
 
     /// Inserts a line break, copying the current line's leading whitespace.
@@ -427,7 +497,7 @@ impl EditorView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        self.insert_text(&text, cx);
+        self.insert_plain(&text, cx);
     }
 
     /// Indents or outdents the selected lines.
@@ -552,23 +622,14 @@ impl EditorView {
         }
     }
 
-    /// Handles a key-down event by inserting printable characters.
-    ///
-    /// Named keys are routed as actions; this only deals with text input.
-    /// Full IME support (composition, dead keys, CJK input) is a roadmap
-    /// item and will replace this with a proper input handler.
-    pub fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let modifiers = event.keystroke.modifiers;
-        if modifiers.control || modifiers.platform || modifiers.alt {
-            return;
-        }
-        let Some(text) = event.keystroke.key_char.as_deref() else {
-            return;
-        };
-        if text.is_empty() || text.chars().any(char::is_control) {
-            return;
-        }
-        self.insert_text(text, cx);
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        let buffer = self.document.buffer();
+        buffer.byte_to_utf16(range.start)..buffer.byte_to_utf16(range.end)
+    }
+
+    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        let buffer = self.document.buffer();
+        buffer.utf16_to_byte(range.start)..buffer.utf16_to_byte(range.end)
     }
 
     fn move_to(&mut self, offset: usize, extend: bool, cx: &mut Context<Self>) {
@@ -598,6 +659,223 @@ impl EditorView {
             self.scroll_handle
                 .scroll_to_item(line, ScrollStrategy::Bottom);
         }
+    }
+}
+
+/// Platform text input: plain typing, paste-through-IME and composition.
+///
+/// GPUI routes all printable text through the focused element's
+/// [`EntityInputHandler`]; named keys (arrows, shortcuts) arrive as actions
+/// instead. All offsets at this boundary are UTF-16 code units, which is
+/// what the platforms speak.
+impl EntityInputHandler for EditorView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.range_from_utf16(&range_utf16);
+        actual_range.replace(self.range_to_utf16(&range));
+        Some(self.document.buffer().slice(range))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&self.selection.range()),
+            reversed: self.selection.head < self.selection.anchor,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Plain typing (no explicit range, no composition) goes through the
+        // editor affordances in `insert_text`.
+        if range_utf16.is_none() && self.marked_range.is_none() {
+            self.insert_text(new_text, cx);
+            return;
+        }
+
+        let range = range_utf16
+            .map(|range| self.range_from_utf16(&range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selection.range());
+        let edit = self.document.edit(range, new_text);
+        self.selection
+            .collapse_to(edit.range.start + new_text.len());
+        self.marked_range = None;
+        self.desired_column = None;
+        self.refresh(cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .map(|range| self.range_from_utf16(&range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selection.range());
+        let edit = self.document.edit(range, new_text);
+        let start = edit.range.start;
+        let end = start + new_text.len();
+        self.marked_range = (!new_text.is_empty()).then_some(start..end);
+        self.selection = match new_selected_range_utf16 {
+            Some(selected) => Selection::region(
+                start + utf16_to_byte_in(new_text, selected.start),
+                start + utf16_to_byte_in(new_text, selected.end),
+            ),
+            None => Selection::region(end, end),
+        };
+        self.desired_column = None;
+        self.refresh(cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let buffer = self.document.buffer();
+        let start = buffer.utf16_to_byte(range_utf16.start);
+        let end = buffer.utf16_to_byte(range_utf16.end);
+        let position = buffer.offset_to_position(start);
+
+        let Some(layout) = self.line_layouts.get(&position.line) else {
+            // The line is not painted; the platform only needs a plausible
+            // anchor for the IME candidate window.
+            return Some(Bounds::new(bounds.origin, size(px(1.), px(LINE_HEIGHT))));
+        };
+
+        let line_start = buffer.line_start_offset(position.line);
+        let content_len = buffer.line_content(position.line).len();
+        let x0 = layout
+            .shaped
+            .x_for_index((start - line_start).min(content_len));
+        let x1 = layout
+            .shaped
+            .x_for_index((end - line_start).min(content_len));
+        Some(Bounds::from_corners(
+            point(layout.bounds.left() + x0, layout.bounds.top()),
+            point(
+                layout.bounds.left() + x1.max(x0 + px(1.)),
+                layout.bounds.bottom(),
+            ),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let (_line, byte) = self.hit_test(point)?;
+        Some(self.document.buffer().byte_to_utf16(byte))
+    }
+}
+
+/// The input area element.
+///
+/// It has no visuals; painting it registers the editor's
+/// [`EntityInputHandler`] with the window for the frame. GPUI only registers
+/// it while the editor's focus handle is focused, so other focused surfaces
+/// (like the command palette) are unaffected.
+pub(crate) struct InputAreaElement {
+    pub(crate) editor: Entity<EditorView>,
+}
+
+impl IntoElement for InputAreaElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for InputAreaElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.editor.read(cx).focus_handle().clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.editor.clone()),
+            cx,
+        );
     }
 }
 
@@ -668,33 +946,28 @@ impl Element for LineElement {
         let font = style.font();
         let base_color = style.color;
 
-        let mut runs: Vec<TextRun> = Vec::new();
-        let mut cursor = 0;
-        for span in spans {
-            if span.start > cursor {
-                runs.push(run(font.clone(), base_color, span.start - cursor));
-            }
-            runs.push(run(
-                font.clone(),
-                editor.theme().syntax.color(span.kind),
-                span.end - span.start,
-            ));
-            cursor = span.end;
-        }
-        if cursor < content_len {
-            runs.push(run(font.clone(), base_color, content_len - cursor));
-        }
-        if runs.is_empty() && content_len > 0 {
-            runs.push(run(font, base_color, content_len));
-        }
+        let line_start = editor.line_start_offset(self.line);
+        let line_end = line_start + content_len;
+        let marked = editor.marked_range.as_ref().and_then(|range| {
+            (range.start < line_end && range.end > line_start).then(|| {
+                (range.start.max(line_start) - line_start)..(range.end.min(line_end) - line_start)
+            })
+        });
+        let runs = line_runs(
+            content_len,
+            spans,
+            &editor.theme().syntax,
+            base_color,
+            font,
+            marked,
+            editor.theme().foreground,
+        );
 
         let shaped =
             window
                 .text_system()
                 .shape_line(SharedString::from(content), font_size, &runs, None);
 
-        let line_start = editor.line_start_offset(self.line);
-        let line_end = line_start + content_len;
         let selection = editor.selection();
         let selection_quad = selection_quad(
             &shaped,
@@ -769,15 +1042,103 @@ fn leading_indent_len(content: &str, unit: &str) -> usize {
     }
 }
 
-fn run(font: gpui::Font, color: Hsla, len: usize) -> TextRun {
-    TextRun {
-        len,
-        font,
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
+/// Returns the closing character that should be inserted for `text`, if
+/// `text` is an opening bracket or a quote.
+fn matching_close_for(text: &str) -> Option<&'static str> {
+    match text {
+        "(" => Some(")"),
+        "[" => Some("]"),
+        "{" => Some("}"),
+        "\"" => Some("\""),
+        "'" => Some("'"),
+        "`" => Some("`"),
+        _ => None,
     }
+}
+
+/// Returns `true` if typing `text` next to its match should skip over it.
+fn is_skippable(text: &str) -> bool {
+    matches!(text, ")" | "]" | "}" | "\"" | "'" | "`")
+}
+
+fn is_quote(text: &str) -> bool {
+    matches!(text, "\"" | "'" | "`")
+}
+
+/// Converts a UTF-16 offset inside `text` to a byte offset, clamping.
+fn utf16_to_byte_in(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    let mut bytes = 0;
+    for character in text.chars() {
+        if units >= utf16 {
+            break;
+        }
+        units += character.len_utf16();
+        bytes += character.len_utf8();
+    }
+    bytes
+}
+
+/// Builds the styled runs for one line.
+///
+/// Syntax spans and the IME preedit range (if any) are merged by cutting
+/// the line at every boundary, so a run is never split incorrectly when a
+/// preedit starts or ends inside a highlighted span.
+#[allow(clippy::too_many_arguments)]
+fn line_runs(
+    content_len: usize,
+    spans: &[stet_syntax::HighlightSpan],
+    syntax: &SyntaxTheme,
+    base_color: Hsla,
+    font: gpui::Font,
+    marked: Option<Range<usize>>,
+    mark_color: Hsla,
+) -> Vec<TextRun> {
+    let mut cuts = vec![0, content_len];
+    for span in spans {
+        cuts.push(span.start);
+        cuts.push(span.end);
+    }
+    if let Some(marked) = &marked {
+        cuts.push(marked.start);
+        cuts.push(marked.end);
+    }
+    cuts.retain(|cut| *cut <= content_len);
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut runs = Vec::new();
+    let mut span_index = 0;
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end {
+            continue;
+        }
+        while span_index < spans.len() && spans[span_index].end <= start {
+            span_index += 1;
+        }
+        let color = spans
+            .get(span_index)
+            .filter(|span| span.start <= start && start < span.end)
+            .map_or(base_color, |span| syntax.color(span.kind));
+        let underline = marked
+            .as_ref()
+            .is_some_and(|marked| marked.start <= start && start < marked.end)
+            .then_some(UnderlineStyle {
+                color: Some(mark_color),
+                thickness: px(1.),
+                wavy: false,
+            });
+        runs.push(TextRun {
+            len: end - start,
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline,
+            strikethrough: None,
+        });
+    }
+    runs
 }
 
 fn selection_quad(
@@ -836,4 +1197,126 @@ fn caret_quad(
         ),
         theme.caret,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext, div, prelude::*};
+
+    struct TestRoot;
+
+    impl gpui::Render for TestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn setup(cx: &mut TestAppContext) -> (Entity<EditorView>, &mut VisualTestContext) {
+        let (_root, cx) = cx.add_window_view(|_window, _cx| TestRoot);
+        let editor = cx.new(|cx| EditorView::new(Document::untitled(), Theme::dark(), cx));
+        (editor, cx)
+    }
+
+    fn text_of(editor: &Entity<EditorView>, cx: &mut VisualTestContext) -> String {
+        editor.update(cx, |editor, _cx| editor.document().buffer().text())
+    }
+
+    #[gpui::test]
+    fn typing_inserts_text(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "hello", window, cx);
+            editor.replace_text_in_range(None, " world", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "hello world");
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.cursor_status()),
+            (1, 12)
+        );
+    }
+
+    #[gpui::test]
+    fn brackets_pair_and_skip(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "(", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "()");
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selection().cursor()),
+            1
+        );
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, ")", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "()");
+        assert_eq!(
+            editor.update(cx, |editor, _cx| editor.selection().cursor()),
+            2
+        );
+    }
+
+    #[gpui::test]
+    fn typing_a_quote_wraps_the_selection(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "word", window, cx);
+            editor.select_all(cx);
+            editor.replace_text_in_range(None, "\"", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "\"word\"");
+    }
+
+    #[gpui::test]
+    fn apostrophes_are_not_doubled_inside_words(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "don", window, cx);
+            editor.replace_text_in_range(None, "'", window, cx);
+            editor.replace_text_in_range(None, "t", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "don't");
+    }
+
+    #[gpui::test]
+    fn composition_marks_and_commits_text(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_and_mark_text_in_range(None, "に", Some(0..1), window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "に");
+        let marked = editor.update_in(cx, |editor, window, cx| {
+            editor.marked_text_range(window, cx)
+        });
+        assert_eq!(marked, Some(0..1));
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "日本", window, cx);
+        });
+        assert_eq!(text_of(&editor, cx), "日本");
+        let marked = editor.update_in(cx, |editor, window, cx| {
+            editor.marked_text_range(window, cx)
+        });
+        assert_eq!(marked, None);
+    }
+
+    #[gpui::test]
+    fn ranges_are_reported_in_utf16(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(None, "a😀b", window, cx);
+            editor.select_all(cx);
+        });
+        let selection = editor.update_in(cx, |editor, window, cx| {
+            editor.selected_text_range(false, window, cx)
+        });
+        assert_eq!(selection.map(|selection| selection.range), Some(0..4));
+
+        let text = editor.update_in(cx, |editor, window, cx| {
+            editor.text_for_range(1..3, &mut None, window, cx)
+        });
+        assert_eq!(text.as_deref(), Some("😀"));
+    }
 }

@@ -13,7 +13,9 @@ built to grow a real plugin ecosystem.
 
 - Native GPU-accelerated UI via [GPUI](https://github.com/zed-industries/zed)
 - Rope-backed text engine with grapheme-aware editing and grouped undo
+- Real IME support: CJK composition, dead keys, preedit rendering
 - Tree-sitter syntax highlighting (Rust, JavaScript, JSON, TOML)
+- Auto-closing brackets and quotes, word/line selection, block indent
 - Tabs, command palette, status bar
 - Atomic file saves, UTF-8 BOM handling, LF/CRLF preservation
 - Sandboxed WASM-first plugin ABI (contracts in place, host on the roadmap)

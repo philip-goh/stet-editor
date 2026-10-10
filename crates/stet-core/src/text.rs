@@ -340,6 +340,32 @@ impl TextBuffer {
         }
     }
 
+    /// Returns the buffer length in UTF-16 code units.
+    ///
+    /// Platform text input APIs (IME, accessibility, tests) measure offsets
+    /// in UTF-16 code units; this is the unit they expect.
+    pub fn len_utf16(&self) -> usize {
+        self.rope.len_utf16_cu()
+    }
+
+    /// Converts a byte offset to a UTF-16 code unit offset.
+    ///
+    /// The offset is clamped to the buffer, and offsets inside a multi-byte
+    /// char round down to the start of that char.
+    pub fn byte_to_utf16(&self, byte: usize) -> usize {
+        let byte = byte.min(self.len_bytes());
+        self.rope.char_to_utf16_cu(self.rope.byte_to_char(byte))
+    }
+
+    /// Converts a UTF-16 code unit offset to a byte offset.
+    ///
+    /// The offset is clamped to the buffer. Offsets inside a surrogate pair
+    /// round down to the start of the character.
+    pub fn utf16_to_byte(&self, utf16: usize) -> usize {
+        let utf16 = utf16.min(self.len_utf16());
+        self.rope.char_to_byte(self.rope.utf16_cu_to_char(utf16))
+    }
+
     /// Returns a hash of the buffer contents.
     ///
     /// The hash is computed over the rope's chunks without materializing a
@@ -594,6 +620,33 @@ mod tests {
         assert_eq!(buffer.word_range_at(4), 4..7);
         // At the newline, the word on the line the offset belongs to wins.
         assert_eq!(buffer.word_range_at(3), 0..3);
+    }
+
+    #[test]
+    fn utf16_conversions_roundtrip_across_widths() {
+        // "a" (1 byte / 1 unit), "é" (2 bytes / 1 unit), "日" (3 bytes / 1),
+        // "😀" (4 bytes / 2 units), "b".
+        let buffer = TextBuffer::new("aé日😀b");
+        assert_eq!(buffer.len_bytes(), 11);
+        assert_eq!(buffer.len_utf16(), 6);
+
+        for (byte, utf16) in [(0, 0), (1, 1), (3, 2), (6, 3), (10, 5), (11, 6)] {
+            assert_eq!(buffer.byte_to_utf16(byte), utf16, "byte {byte}");
+            assert_eq!(buffer.utf16_to_byte(utf16), byte, "utf16 {utf16}");
+        }
+    }
+
+    #[test]
+    fn utf16_conversions_clamp_and_round_down() {
+        let buffer = TextBuffer::new("a😀b");
+        // Offsets past the end clamp.
+        assert_eq!(buffer.byte_to_utf16(99), buffer.len_utf16());
+        assert_eq!(buffer.utf16_to_byte(99), buffer.len_bytes());
+        // The second code unit of the surrogate pair rounds to the char
+        // start (byte 1).
+        assert_eq!(buffer.utf16_to_byte(2), 1);
+        // A byte inside the emoji rounds down to its start.
+        assert_eq!(buffer.byte_to_utf16(2), 1);
     }
 
     #[test]

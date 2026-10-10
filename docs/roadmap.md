@@ -41,11 +41,15 @@ unit-testable.
 
 The one gap that makes the editor unusable for CJK and dead-key input.
 
-- [ ] `EntityInputHandler` + `ElementInputHandler` in the editor surface
-- [ ] UTF-16 ↔ byte offset conversion helpers in `stet-core`, tested
-- [ ] Preedit/marked text rendering (underline) and IME cursor area
-- [ ] Auto-closing bracket/quote pairs that respect selections
+- [x] `EntityInputHandler` + `ElementInputHandler` in the editor surface
+- [x] UTF-16 ↔ byte offset conversion helpers in `stet-core`, tested
+- [x] Preedit/marked text rendering (underline) and IME cursor area
+- [x] Auto-closing bracket/quote pairs that respect selections
+- [x] Headless GPUI tests for typing, composition and pairs
+      (`gpui/test-support`)
 - Acceptance: conversion tests; smoke test with a dead key and a CJK IME.
+  (CJK/dead-key smoke testing needs a human with an IME; the automated
+  input-path tests cover the handler contract.)
 
 ### Iteration 3 — Find and replace
 

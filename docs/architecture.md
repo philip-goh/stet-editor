@@ -81,12 +81,21 @@ layer on top ([ADR 0007](adr/0007-vscode-extension-compatibility.md)).
 ```
 platform key event
   -> GPUI keymap resolves an action (arrows, cmd-s, ...)  -> Workspace::on_*
-  -> otherwise KeyDown reaches the focused editor          -> EditorView::handle_key_down
-  -> EditorView::insert_text / delete_backward / ...
+  -> otherwise printable text arrives via the focused
+     EntityInputHandler (IME insertText / key repeat)     -> EditorView::replace_text_in_range
+  -> auto-pairs and wrapping apply                        -> EditorView::insert_text
   -> Document::edit -> TextBuffer::edit (rope) + History::record
   -> Highlighter::refresh on the new text
   -> cx.notify() -> Workspace re-renders affected lines
 ```
+
+The editor registers itself as the window's input handler from a paint-only
+element ([`InputAreaElement`](../crates/stet-ui/src/editor.rs)); GPUI only
+registers it while the editor's focus handle is focused, which is why the
+command palette keeps its own `key_char` handler and does not double-type.
+Composition (CJK, dead keys) arrives as marked ranges, rendered with an
+underline until committed; all offsets at that boundary are UTF-16, which
+`stet-core` converts (`byte_to_utf16`, `utf16_to_byte`).
 
 Paste, clipboard and file dialogs go through GPUI's native platform APIs
 (`read_from_clipboard`, `prompt_for_paths`, `prompt_for_new_path`) — there is
@@ -115,7 +124,6 @@ The two planned escape hatches, in order:
 Tracked in the [roadmap](roadmap.md), listed here so nobody mistakes them
 for bugs:
 
-- IME/composition is not wired (`key_char` only).
 - No multi-cursor, no find/replace, no line wrapping.
 - Highlighting is synchronous and size-limited.
 - No settings file; the action list is static.

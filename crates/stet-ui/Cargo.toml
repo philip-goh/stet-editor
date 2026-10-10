@@ -25,3 +25,7 @@ stet-plugin.workspace = true
 stet-syntax.workspace = true
 gpui.workspace = true
 futures.workspace = true
+
+[dev-dependencies]
+# Enables GPUI's headless test harness (TestAppContext) for input tests.
+gpui = { workspace = true, features = ["test-support"] }
